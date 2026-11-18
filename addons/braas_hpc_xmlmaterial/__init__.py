@@ -19,8 +19,8 @@ bl_info = {
     "name": "BRaaS-HPC-XMLMaterial",
     "author": "Milan Jaros, Petr Strakos, Lubomir Riha",
     "description": "",
-    "blender": (4, 5, 0),
-    "version": (4, 5, 5),
+    "blender": (5, 2, 0),
+    "version": (5, 2, 0),
     "location": "",
     "warning": "",
     "category": "Material"

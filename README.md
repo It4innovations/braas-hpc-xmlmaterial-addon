@@ -28,8 +28,9 @@ The addon provides a simple interface in Blender's Shader Editor, allowing you t
 
 ## Requirements
 
-- **Blender**: Version 4.5.0 or higher
-- **Operating System**: Windows, macOS, or Linux (any platform that supports Blender 4.5+)
+- **Blender**: Version 5.2.0 or higher
+- **Operating System**: Windows, macOS, or Linux (any platform that supports Blender 5.2+)
+- **Reader**: [CyclesPhi](https://github.com/It4innovations/cyclesphi) (`src/app/cycles_xml_bin.cpp`)
 
 ## Installation
 
@@ -77,26 +78,42 @@ To export an individual node:
 
 ### Understanding the Output
 
-The exported XML includes:
+The conversion follows Blender's Cycles synchronization (`intern/cycles/blender/shader.cpp`), so
+CyclesPhi builds the same shader graph as Cycles inside Blender. The exported XML includes:
 
-- **Shader root element**: Contains the shader name
-- **Node elements**: Each node is represented with its type and name
-- **Socket elements**: Node input parameters with their default values
-- **Connect elements**: Links between nodes, showing data flow
-- **Attributes**: Node-specific properties (e.g., blend mode, interpolation type)
+- **Shader root element**: The shader name (`default_background` for a World, which CyclesPhi
+  assigns to the scene background) and the material settings as `<socket>` children
+- **Node elements**: The Cycles node type (e.g. `principled_bsdf`) and a unique node name
+- **Socket elements**: Node parameters and input values, written with both the Cycles socket
+  `name` and `ui_name`, which the reader requires to match
+- **Connect elements**: Links between Cycles sockets; `output` is the shader graph output
+
+Node groups are inlined, reroutes and muted nodes are resolved, and only the active Cycles
+material output is used, all connected through proxy nodes (`convert_<type>_to_<type>`) like in
+Blender.
 
 Example XML structure:
 ```xml
 <?xml version="1.0" ?>
 <shader name="Material">
+  <socket name="volume_step_rate" ui_name="Volume Step Rate" value="1.0" />
   <principled_bsdf name="Principled BSDF">
-    <socket ui_name="Base Color" value="0.8 0.8 0.8 1.0"/>
-    <socket ui_name="Metallic" value="0.0"/>
-    <socket ui_name="Roughness" value="0.5"/>
+    <socket name="base_color" ui_name="Base Color" value="0.8 0.8 0.8 0.0" />
+    <socket name="roughness" ui_name="Roughness" value="0.5" />
   </principled_bsdf>
-  <connect from="Principled BSDF BSDF" to="Material Output Surface"/>
+  <connect from_node="Principled BSDF" from_socket="BSDF" from_socket_ui="BSDF"
+           to_node="output" to_socket="surface" to_socket_ui="Surface" />
 </shader>
 ```
+
+Array values (color ramps, curves) are written inline, as read by
+`xml_read_shader_graph_from_string()`. When the shader is part of a scene file loaded with its
+`.xml.bin` companion, pass a `bytearray` as `binary` to `export_shader()`; the arrays are then
+appended to it and the sockets hold byte offsets into it.
+
+Not exported: Script (OSL) nodes, sampled attribute outputs of the Raycast node, and Boolean Math,
+Integer Math and Get Vector Component nodes (not available in CyclesPhi). Packed and generated
+images are exported by their file path.
 
 ## Technical Details
 
@@ -117,7 +134,10 @@ The addon maps Blender's Cycles shader nodes to XML elements. The mapping includ
 - `__init__.py`: Addon registration and metadata
 - `braas_hpc_xmlmaterial_panel.py`: GUI panel and operators
 - `braas_hpc_xmlmaterial_convert.py`: Core export logic and XML generation
-- `braas_hpc_xmlmaterial_map.py`: Node type mappings between Blender and XML
+- `braas_hpc_xmlmaterial_map.py`: Blender node to Cycles node class mapping
+- `braas_hpc_xmlmaterial_sockets.py`: Cycles node sockets, generated from the CyclesPhi sources by
+  `tools/generate_cycles_sockets.py` (re-run it when the Cycles shader nodes change:
+  `python tools/generate_cycles_sockets.py <cyclesphi_root>`)
 - `braas_hpc_xmlmaterial_pref.py`: Addon preferences (currently minimal)
 
 # License

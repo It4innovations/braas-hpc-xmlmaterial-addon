@@ -15,1377 +15,1315 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #####################################################################################################################
+"""
+Export of Blender shader node trees to the CyclesPhi XML shader format.
+
+The conversion follows intern/cycles/blender/shader.cpp (add_node, add_nodes, set_default_value,
+node_find_input_by_name, node_find_output_by_name, sync_materials, sync_world, sync_lights).
+
+The output is read by CyclesPhi (src/app/cycles_xml_bin.cpp, src/graph/node_xml_bin.cpp):
+
+    <shader name="Material">
+      <socket name="volume_step_rate" ui_name="Volume Step Rate" value="1"/>
+      <principled_bsdf name="Principled BSDF">
+        <socket name="base_color" ui_name="Base Color" value="0.8 0.8 0.8 0"/>
+      </principled_bsdf>
+      <connect from_node="Principled BSDF" from_socket="BSDF" from_socket_ui="BSDF"
+               to_node="output" to_socket="surface" to_socket_ui="Surface"/>
+    </shader>
+
+Sockets are written with both the Cycles socket name and UI name. The reader requires both to
+match, which keeps sockets with the same UI name apart (e.g. texture mapping "Scale" and the
+"Scale" input of a noise texture).
+"""
+
 import bpy
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
-
-from . import braas_hpc_xmlmaterial_map
-
-import xml.etree.ElementTree as ET
-import struct
-
 import math
-import numpy as np
+import struct
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+from . import braas_hpc_xmlmaterial_map as node_map
+from .braas_hpc_xmlmaterial_sockets import CYCLES_NODES
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
+
+RAMP_TABLE_SIZE = 256
+FLT_MAX = 3.4028234663852886e38
+
+# Name of the graph output node, the XML reader maps it to ShaderGraph::output().
+OUTPUT_NODE_NAME = "output"
+# Shader name the XML reader assigns to Scene::default_background.
+WORLD_SHADER_NAME = "default_background"
+
+
+def report(message):
+    print(f"BRaaS-HPC-XMLMaterial: {message}")
+
+#########################################################################################
+# Cycles node types
+
+
+class CyclesSocket:
+    __slots__ = ("name", "ui_name", "type", "linkable")
+
+    def __init__(self, name, ui_name, socket_type, linkable=True):
+        self.name = name
+        self.ui_name = ui_name
+        self.type = socket_type
+        self.linkable = linkable
+
+
+class CyclesNodeType:
+    def __init__(self, xml_type, class_name, inputs, outputs):
+        self.xml_type = xml_type
+        self.class_name = class_name
+        # All node sockets by name (linkable inputs and parameters).
+        self.params = {}
+        for s in inputs:
+            self.params.setdefault(s.name, s)
+        # ShaderNode::inputs only contains the linkable sockets.
+        self.inputs = [s for s in inputs if s.linkable]
+        self.outputs = outputs
+
+    # ShaderNode::input() / ShaderNode::output() compare against the UI name.
+    def input(self, ui_name):
+        for s in self.inputs:
+            if s.ui_name == ui_name:
+                return s
+        return None
+
+    def output(self, ui_name):
+        for s in self.outputs:
+            if s.ui_name == ui_name:
+                return s
+        return None
+
+
+_node_types = {}
+
+
+def cycles_node_type(xml_type):
+    node_type = _node_types.get(xml_type)
+    if node_type is None:
+        entry = CYCLES_NODES.get(xml_type)
+        if entry is None:
+            return None
+        class_name, inputs, outputs = entry
+        node_type = CyclesNodeType(xml_type,
+                                   class_name,
+                                   [CyclesSocket(*s) for s in inputs],
+                                   [CyclesSocket(*s) for s in outputs])
+        _node_types[xml_type] = node_type
+    return node_type
+
+
+def proxy_node_type(socket_type):
+    """ConvertNode with the same input and output type, used as a proxy (SHADER_SPECIAL_TYPE_PROXY)."""
+    xml_type = f"convert_{socket_type}_to_{socket_type}"
+    node_type = _node_types.get(xml_type)
+    if node_type is None:
+        value = f"value_{socket_type}"
+        node_type = CyclesNodeType(xml_type,
+                                   "ConvertNode",
+                                   [CyclesSocket(value, value, socket_type)],
+                                   [CyclesSocket(value, value, socket_type)])
+        _node_types[xml_type] = node_type
+    return node_type
+
+
+def convert_socket_type(b_socket):
+    """convert_socket_type() in shader.cpp"""
+    return {
+        'VALUE': "float",
+        'BOOLEAN': "int",
+        'INT': "int",
+        'VECTOR': "vector",
+        'RGBA': "color",
+        'STRING': "string",
+        'SHADER': "closure",
+    }.get(b_socket.type)
+
+#########################################################################################
+# Value formatting
+
+
+def fmt_float(value):
+    value = float(value)
+    if math.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    if math.isnan(value):
+        return "nan"
+    if np is not None:
+        # Shortest representation of the float32 value Cycles will use.
+        return str(np.float32(value))
+    return f"{value:.9g}"
+
+
+def is_scalar(value):
+    return isinstance(value, (bool, int, float))
+
+
+def as_floats(value, size):
+    if is_scalar(value):
+        values = [float(value)] * size
+    else:
+        values = [float(v) for v in value][:size]
+        values += [0.0] * (size - len(values))
+    return values
+
+
+def transform_rows(matrix):
+    """get_transform() in blender/util.h: first three rows of the 4x4 matrix, row major."""
+    return [float(matrix[row][col]) for row in range(3) for col in range(4)]
+
 
 class XMLWriter:
-  def __init__(self):
-    self.base = "" #path to xml #e:\\tmp\\braas_hpc_xmlmaterial\\
+    """Collects the Cycles nodes and connections of one exported shader graph.
 
-def float_array_to_string(value):
+    binary: optional bytearray. When set, array sockets are appended to it in the layout of
+    read_array_from_binary_file() (node_xml_bin.cpp) and the socket value is the byte offset.
+    The XML reader then has to be given the binary file, in which case every array socket of the
+    scene has to be stored in it.
     """
-    Converts a list of floats or a list of lists of floats to a space-separated string.
 
-    :param value: List of floats or list of lists of floats
-    :return: Space-separated string of float values
-    """
-    if any(isinstance(v, list) for v in value):
-        # Flatten nested lists
-        flat_list = [str(f) for sublist in value for f in sublist]
-    else:
-        # Convert single list of floats
-        flat_list = [str(f) for f in value]
+    def __init__(self, binary=None):
+        self.binary = binary
+        self.nodes = []
+        self.connections = []
+        self.names = {OUTPUT_NODE_NAME}
+        self.output = None
 
-    return " ".join(flat_list)    
+    def unique_name(self, name):
+        if name not in self.names:
+            self.names.add(name)
+            return name
+        index = 1
+        while f"{name}.{index:03d}" in self.names:
+            index += 1
+        name = f"{name}.{index:03d}"
+        self.names.add(name)
+        return name
 
-# Write an array to a binary file
-def write_array_to_binary_file(writer_base, name, data):
-    if len(writer_base.base) == 0:
-       return float_array_to_string(data)
+    def add_node(self, xml_type, name):
+        node_type = cycles_node_type(xml_type)
+        if node_type is None:
+            report(f'Cycles node type "{xml_type}" is not known to CyclesPhi, node "{name}" skipped.')
+            return None
+        node = XMLNode(self, node_type, self.unique_name(name))
+        self.nodes.append(node)
+        return node
 
-    filename = f"{writer_base.base}/{name}.array"
+    def add_proxy(self, socket_type, name):
+        node = XMLNode(self, proxy_node_type(socket_type), self.unique_name(name))
+        self.nodes.append(node)
+        return node
 
-    try:
-        with open(filename, "wb") as file:
-            # Write the size of the array
-            file.write(struct.pack('Q', len(data)))
-            # Write the array data
-            #file.write(bytearray(data))
-            # Pack the entire array as binary data and write it to the file
-            file.write(struct.pack(f'{len(data)}f', *data))
-    except IOError as e:
-        print(f"Error: Could not open file for writing: {filename}")
-        return ""
+    def output_node(self):
+        # The output node exists in every ShaderGraph and the reader maps the name "output" to it.
+        # It is not written as an element: CyclesPhi builds before 2026-10 (389cac3dd) create a
+        # second, unconnected output node for it. Its only value input, Displacement, has the same
+        # default (zero) in Blender and Cycles.
+        if self.output is None:
+            self.output = XMLNode(self, cycles_node_type("output"), OUTPUT_NODE_NAME)
+        return self.output
 
-    return filename
+    def connect(self, from_socket, to_socket):
+        """from_socket, to_socket: (XMLNode, CyclesSocket)"""
+        self.connections.append((from_socket, to_socket))
 
-# Convert boolean value to "true" or "false"
-def xml_write_boolean(value):
-    return "true" if value else "false"
+    def array(self, fmt, values, count, text):
+        if self.binary is None:
+            return " ".join(text(v) for v in values)
+        offset = len(self.binary)
+        self.binary += struct.pack("<Q", count)
+        self.binary += struct.pack(f"<{len(values)}{fmt}", *values)
+        return str(offset)
 
-class CustomSocket:
-  def __init__(self):
-    self.identifier = None
-    self.default_value = None
-    self.type = None
+    def format_value(self, socket_type, value):
+        t = socket_type
+        if t == "boolean":
+            return "true" if value else "false"
+        if t in ("int", "uint", "uint64"):
+            return str(int(value))
+        if t == "enum":
+            return value if isinstance(value, str) else str(int(value))
+        if t == "float":
+            return fmt_float(value)
+        if t in ("color", "vector", "point", "normal"):
+            # float3 is read as 4 components (node_xml_bin.cpp, xml_read_float_array<4>).
+            return " ".join(fmt_float(v) for v in as_floats(value, 3) + [0.0])
+        if t == "point2":
+            return " ".join(fmt_float(v) for v in as_floats(value, 2))
+        if t == "string":
+            return str(value)
+        if t == "transform":
+            return " ".join(fmt_float(v) for v in value)
+        if t == "float_array":
+            values = [float(v) for v in value]
+            return self.array("f", values, len(values), fmt_float)
+        if t == "int_array":
+            values = [int(v) for v in value]
+            return self.array("i", values, len(values), str)
+        if t == "boolean_array":
+            values = [bool(v) for v in value]
+            return self.array("?", values, len(values), lambda v: "true" if v else "false")
+        if t in ("color_array", "vector_array", "point_array", "normal_array"):
+            # Stored as 16 byte float3.
+            values = []
+            for v in value:
+                values += as_floats(v, 3) + [0.0]
+            return self.array("f", values, len(values) // 4, fmt_float)
+        if t == "point2_array":
+            values = []
+            for v in value:
+                values += as_floats(v, 2)
+            return self.array("f", values, len(values) // 2, fmt_float)
+        if t == "string_array":
+            return " ".join(str(v) for v in value)
+        return None
 
-  def __init__(self, id, value, type):
-    self.identifier = id
-    self.default_value = value
-    self.type = type
 
-def get_socket_identifier(socket, node):
-  identifier = socket.identifier
+class XMLNode:
+    def __init__(self, writer, node_type, name):
+        self.writer = writer
+        self.type = node_type
+        self.name = name
+        self.sockets = {}
 
-  if node.type == 'MATH':
-     if socket.identifier == 'Value':
-        identifier = 'Value1'
-     elif socket.identifier == 'Value_001':
-        identifier = 'Value2'
-     elif socket.identifier == 'Value_002':
-        identifier = 'Value3'              
+    def set(self, name, value):
+        """Set a node socket (parameter or input) by its Cycles socket name."""
+        socket = self.type.params.get(name)
+        if socket is None:
+            report(f'Cycles node "{self.type.xml_type}" has no socket "{name}" (node "{self.name}").')
+            return
+        self.set_socket(socket, value)
 
-  return identifier    
+    def set_socket(self, socket, value):
+        text = self.writer.format_value(socket.type, value)
+        if text is None:
+            report(f'Socket type "{socket.type}" of "{self.name}.{socket.name}" is not supported.')
+            return
+        self.sockets[socket.name] = (socket.ui_name, text)
 
-def xml_write_socket(writer_base: XMLWriter, xml_node, node, socket):
-    # Types: ('CUSTOM', 'VALUE', 'INT', 'BOOLEAN', 'VECTOR', 'ROTATION', 'MATRIX', 
-    # 'STRING', 'RGBA', 'SHADER', 'OBJECT', 'IMAGE', 'GEOMETRY', 'COLLECTION', 
-    # 'TEXTURE', 'MATERIAL', 'MENU')
-    
-    # if socket.type in ["CLOSURE", "UNDEFINED"] or socket.get('flags', 0) & socket.get('INTERNAL', 0):
-    #     continue
+    def write_sockets(self, xml_element):
+        for name, (ui_name, value) in self.sockets.items():
+            ET.SubElement(xml_element, "socket", name=name, ui_name=ui_name, value=value)
 
-    # if node.get('has_default_value', lambda x: False)(socket):
-    #     continue
+    def to_xml(self, xml_root):
+        xml_node = ET.SubElement(xml_root, self.type.xml_type, name=self.name)
+        self.write_sockets(xml_node)
+        return xml_node
 
-    if socket.type == "SHADER":
-       #skip
-       return
-    
-    socket_identifier = get_socket_identifier(socket, node)
-
-    xml_node_socket = ET.SubElement(xml_node, "socket")
-    xml_node_socket.set("ui_name", socket_identifier)
-
-    xml_node_name = xml_node.get("name").replace(" ", "_")
-    xml_socket_name = socket_identifier.replace(" ", "_")
-    socket_file = f"{xml_node_name}_{xml_socket_name}"
-
-    if socket.type in ["VALUE", "INT", "STRING", "ENUM"]: # Float
-        xml_node_socket.set("value", str(socket.default_value))
-
-    elif socket.type == "BOOLEAN":
-        xml_node_socket.set("value", xml_write_boolean(socket.default_value))
-
-    # elif socket.type == "BOOLEAN_ARRAY":
-    #     value = node['get_bool_array'](socket)
-    #     xml_node_socket.set(socket_identifier, write_array_to_binary_file(writer_base, socket_file, value))
-
-    elif socket.type in ["FLOAT_ARRAY"]:
-        value = socket.default_value
-        xml_node_socket.set("value", write_array_to_binary_file(writer_base, socket_file, value))
-
-    # elif socket.type == "INT_ARRAY":
-    #     value = node['get_int_array'](socket)
-    #     xml_node_socket.set(socket_identifier, write_array_to_binary_file(writer_base, socket_file, value))
-
-    elif socket.type in ["RGBA", "VECTOR", "ROTATION"]:
-        if len(socket.default_value) == 2:
-            value = socket.default_value
-            xml_node_socket.set("value", f"{value[0]} {value[1]} 0 0")
-        elif len(socket.default_value) == 3:
-            value = socket.default_value
-            xml_node_socket.set("value", f"{value[0]} {value[1]} {value[2]} 0")
-        elif len(socket.default_value) == 4:
-            value = socket.default_value
-            xml_node_socket.set("value", f"{value[0]} {value[1]} {value[2]} {value[3]}")
-        else:
-            print("not implemented: ", socket_identifier, socket.type, str(socket.default_value))                
-
-    # elif socket.type == "TRANSFORM":
-    #     tfm = node['get_transform'](socket)
-    #     xml_node_socket.set(socket_identifier, " ".join(
-    #         [" ".join(map(str, row)) for row in tfm]
-    #     ))
-
-    # elif socket.type == "NODE":
-    #     value = node['get_node'](socket)
-    #     if value:
-    #         xml_node_socket.set(socket_identifier, value)
-
-    # elif socket.type == "NODE_ARRAY":
-    #     value = node['get_node_array'](socket)
-    #     xml_node_socket.set(socket_identifier, " ".join(
-    #         v if v else "" for v in value
-    #     ))
-    else:
-        print("not implemented: ", socket_identifier, socket.type, str(socket))
-
-def xml_write_node_name(xml_root, node, cycles_node, cycles_type = 0):
-    cycles_node_xml_type = cycles_node[braas_hpc_xmlmaterial_map.CyclesNode][cycles_type][braas_hpc_xmlmaterial_map.CyclesNodeXml]
-    xml_node = ET.SubElement(xml_root, cycles_node_xml_type)
-    xml_node_name = node.name
-    xml_node.set("name", xml_node_name)   
-
-    return xml_node
-   
-def xml_write_enum(writer_base, xml_node, node, id, value, value_name):   
-   ivalue = node.bl_rna.properties[value_name].enum_items[value].value
-   xml_write_socket(writer_base, xml_node, node, CustomSocket(id, value=ivalue, type="ENUM"))
-   
 #########################################################################################
-def b_node_is_a(cycles_node, struct_name):
-    return cycles_node[braas_hpc_xmlmaterial_map.StructName] == struct_name
+# Blender helpers
 
-def curvemap_minmax_curve(curve, min_x, max_x):
-    min_x = min(min_x, curve.points[0].location[0])
-    max_x = max(max_x, curve.points[len(curve.points) - 1].location[0])
 
-    return min_x, max_x
+def enum_value(rna, prop):
+    """Integer value of an RNA enum property (what get_enum() / DNA storage give in C++)."""
+    return rna.bl_rna.properties[prop].enum_items[getattr(rna, prop)].value
 
-def curvemapping_minmax(cumap, num_curves):
-    min_x = float('inf')
-    max_x = float('-inf')
-    for i in range(num_curves):
-        map_curve = cumap.curves[i]
-        min_x, max_x = curvemap_minmax_curve(map_curve, min_x, max_x)
 
-    return min_x, max_x
+def validate_enum_value(value, num_values, default_value):
+    return default_value if value >= num_values else value
 
-def curvemapping_to_array(cumap, size):
-    cumap.update()
-    curve = cumap.curves[0]
-    full_size = size + 1
-    data = []
-    for i in range(full_size):
-        t = float(i) / float(size)
-        data.append(cumap.evaluate(curve, t))
 
-    return data
+def socket_by_identifier(sockets, identifier):
+    for socket in sockets:
+        if socket.identifier == identifier:
+            return socket
+    return None
 
-def curvemapping_float_to_array(cumap, size):   
-    min_x, max_x = curvemapping_minmax(cumap, 1)
-    
-    range_x = max_x - min_x
-    
-    cumap.update()
 
-    curve = cumap.curves[0]
-    full_size = size + 1
-    data = []
-    for i in range(full_size):
-        t = min_x + (float(i) / float(size)) * range_x
-        data.append(cumap.evaluate(curve, t))
+def socket_is_available(b_socket):
+    return getattr(b_socket, "enabled", True)
 
-    return data
 
-def curvemapping_color_to_array(cumap, size, rgb_curve):   
-    num_curves = 4 if rgb_curve else 3
-    min_x, max_x = curvemapping_minmax(cumap, num_curves)
-    
-    range_x = max_x - min_x
-    
-    cumap.update()
-    
-    map_r = cumap.curves[0]
-    map_g = cumap.curves[1]
-    map_b = cumap.curves[2]
-    
-    full_size = size + 1
-    data = []
-    
-    if rgb_curve:
-        map_i = cumap.curves[3]
-        for i in range(full_size):
-            t = min_x + (float(i) / float(size)) * range_x
-            intensity = cumap.evaluate(map_i, t)
-            data.append(cumap.evaluate(map_r, intensity))
-            data.append(cumap.evaluate(map_g, intensity))
-            data.append(cumap.evaluate(map_b, intensity))
-    else:
-        for i in range(full_size):
-            t = min_x + (float(i) / float(size)) * range_x
-            data.append(cumap.evaluate(map_r, t))
-            data.append(cumap.evaluate(map_g, t))
-            data.append(cumap.evaluate(map_b, t))
+def blender_absolute_path(b_id, path):
+    return bpy.path.abspath(path, library=getattr(b_id, "library", None)) if path else path
 
-    return data        
 
-def colorramp_to_array(ramp, size):
-    """
-    Convert a color ramp to arrays of colors and alpha values.
-
-    Parameters:
-    ramp : A color ramp object that has an `evaluate` method.
-    ramp_color : List to store the color values (as tuples of three floats).
-    ramp_alpha : List to store the alpha values (as floats).
-    size : The number of divisions in the ramp.
-    """
-    full_size = size + 1
-    
-    # Resize the output lists.
-    ramp_color = []
-    ramp_alpha = []
-
-    for i in range(full_size):
-        color = ramp.evaluate(float(i) / float(size))  # Evaluate the ramp.
-        
-        ramp_color.append(color[0])  # Extract RGB.
-        ramp_color.append(color[1])  # Extract RGB.
-        ramp_color.append(color[2])  # Extract RGB.
-        ramp_color.append(color[3])  # Extract RGB.
-
-        ramp_alpha.append(color[3])  # Extract Alpha.
-
-    return ramp_color, ramp_alpha
-
-# Define the attribute prefixes
 OBJECT_ATTR_PREFIX = "\x01object:"
 INSTANCER_ATTR_PREFIX = "\x01instancer:"
 VIEW_LAYER_ATTR_PREFIX = "\x01layer:"
 
-def blender_attribute_name_add_type(name: str, attr_type: str) -> str:
+
+def blender_attribute_name_add_type(name, attr_type):
     if attr_type == 'OBJECT':
-        return f"{OBJECT_ATTR_PREFIX}{name}"
-    elif attr_type == 'INSTANCER':
-        return f"{INSTANCER_ATTR_PREFIX}{name}"
-    elif attr_type == 'VIEW_LAYER':
-        return f"{VIEW_LAYER_ATTR_PREFIX}{name}"
-    else:
-        return name
+        return OBJECT_ATTR_PREFIX + name
+    if attr_type == 'INSTANCER':
+        return INSTANCER_ATTR_PREFIX + name
+    if attr_type == 'VIEW_LAYER':
+        return VIEW_LAYER_ATTR_PREFIX + name
+    return name
+
+
+def curvemapping_minmax(cumap, num_curves):
+    min_x = FLT_MAX
+    max_x = -FLT_MAX
+    for i in range(num_curves):
+        points = cumap.curves[i].points
+        min_x = min(min_x, points[0].location[0])
+        max_x = max(max_x, points[len(points) - 1].location[0])
+    return min_x, max_x
+
+
+def curvemapping_prepare(cumap):
+    # BKE_curvemapping_changed_all() + BKE_curvemapping_init()
+    cumap.update()
+    cumap.initialize()
+
+
+def curvemapping_float_to_array(cumap, size):
+    min_x, max_x = curvemapping_minmax(cumap, 1)
+    range_x = max_x - min_x
+    curvemapping_prepare(cumap)
+    curve = cumap.curves[0]
+    return [cumap.evaluate(curve, min_x + float(i) / float(size) * range_x) for i in range(size + 1)]
+
+
+def curvemapping_color_to_array(cumap, size, rgb_curve):
+    min_x, max_x = curvemapping_minmax(cumap, 4 if rgb_curve else 3)
+    range_x = max_x - min_x
+    curvemapping_prepare(cumap)
+
+    map_r, map_g, map_b = cumap.curves[0], cumap.curves[1], cumap.curves[2]
+    data = []
+    for i in range(size + 1):
+        t = min_x + float(i) / float(size) * range_x
+        if rgb_curve:
+            map_i = cumap.curves[3]
+            data.append((cumap.evaluate(map_r, cumap.evaluate(map_i, t)),
+                         cumap.evaluate(map_g, cumap.evaluate(map_i, t)),
+                         cumap.evaluate(map_b, cumap.evaluate(map_i, t))))
+        else:
+            data.append((cumap.evaluate(map_r, t), cumap.evaluate(map_g, t), cumap.evaluate(map_b, t)))
+    return data
+
+
+def colorramp_to_array(ramp, size):
+    ramp_color = []
+    ramp_alpha = []
+    for i in range(size + 1):
+        color = ramp.evaluate(float(i) / float(size))
+        ramp_color.append((color[0], color[1], color[2]))
+        ramp_alpha.append(color[3])
+    return ramp_color, ramp_alpha
+
+
+def get_tex_mapping(xn, b_mapping):
+    if b_mapping is None:
+        return
+    xn.set("tex_mapping.translation", b_mapping.translation)
+    xn.set("tex_mapping.rotation", b_mapping.rotation)
+    xn.set("tex_mapping.scale", b_mapping.scale)
+    xn.set("tex_mapping.type", enum_value(b_mapping, "vector_type"))
+    xn.set("tex_mapping.x_mapping", enum_value(b_mapping, "mapping_x"))
+    xn.set("tex_mapping.y_mapping", enum_value(b_mapping, "mapping_y"))
+    xn.set("tex_mapping.z_mapping", enum_value(b_mapping, "mapping_z"))
+
+
+def is_image_animated(b_image, b_image_user):
+    return b_image.source in {'MOVIE', 'SEQUENCE'} and b_image_user.use_auto_refresh
+
+
+def image_is_builtin(b_image):
+    if b_image.source == 'TILED':
+        for tile in b_image.tiles:
+            if getattr(tile, "is_generated", False):
+                return True
+    return (b_image.packed_file is not None or b_image.source in {'GENERATED', 'MOVIE'} or
+            b_image.is_dirty)
+
+
+def image_user_file_path(b_image, b_image_user):
+    filepath = b_image.filepath_from_user(image_user=b_image_user)
+    return blender_absolute_path(b_image, filepath)
+
+
+def set_image(xn, b_node, b_image, b_image_user, use_tiles):
+    xn.set("colorspace", b_image.colorspace_settings.name)
+    xn.set("animated", is_image_animated(b_image, b_image_user))
+    # IMAGE_ALPHA_NUM_TYPES = 5, IMAGE_ALPHA_AUTO = 4
+    xn.set("alpha_type", validate_enum_value(enum_value(b_image, "alpha_mode"), 5, 4))
+
+    if use_tiles and b_image.source == 'TILED':
+        xn.set("tiles", [tile.number for tile in b_image.tiles])
+
+    if image_is_builtin(b_image):
+        # Blender reads these from memory (BlenderImageLoader), the XML reader can only load files.
+        report(f'Image "{b_image.name}" of node "{b_node.name}" is packed, generated, a movie or '
+               f'modified; exporting its file path, which may not contain the current pixels.')
+
+    xn.set("filename", image_user_file_path(b_image, b_image_user))
 
 #########################################################################################
+# Nodes, add_node() in shader.cpp
 
-def create_xml_node(writer_base: XMLWriter, xml_root, node):
-  xml_node = None
+# Distribution / closure enums are written by their Cycles enum names (see shader_nodes.cpp).
+GLOSSY_DISTRIBUTION = {'BECKMANN': "beckmann", 'GGX': "ggx",
+                       'ASHIKHMIN_SHIRLEY': "ashikhmin_shirley", 'MULTI_GGX': "multi_ggx"}
+METALLIC_DISTRIBUTION = {'BECKMANN': "beckmann", 'GGX': "ggx", 'MULTI_GGX': "multi_ggx"}
+METALLIC_FRESNEL = {'PHYSICAL_CONDUCTOR': "physical_conductor", 'F82': "f82"}
+GLASS_DISTRIBUTION = {'BECKMANN': "beckmann", 'GGX': "ggx", 'MULTI_GGX': "multi_ggx"}
+REFRACTION_DISTRIBUTION = {'BECKMANN': "beckmann", 'GGX': "ggx"}
+PRINCIPLED_DISTRIBUTION = {'GGX': "ggx", 'MULTI_GGX': "multi_ggx"}
+SUBSURFACE_METHOD = {'BURLEY': "burley", 'RANDOM_WALK': "random_walk",
+                     'RANDOM_WALK_SKIN': "random_walk_skin", 'RANDOM_WALK_LEGACY': "random_walk_legacy"}
+TOON_COMPONENT = {'DIFFUSE': "diffuse", 'GLOSSY': "glossy"}
+HAIR_COMPONENT = {'Reflection': "reflection", 'Transmission': "transmission"}
+SHEEN_DISTRIBUTION = {'ASHIKHMIN': "ashikhmin", 'MICROFIBER': "microfiber"}
+VOLUME_PHASE = {'HENYEY_GREENSTEIN': "Henyey-Greenstein", 'FOURNIER_FORAND': "Fournier-Forand",
+                'DRAINE': "Draine", 'RAYLEIGH': "Rayleigh", 'MIE': "Mie"}
 
-  cycles_node = braas_hpc_xmlmaterial_map.find_by_enum_type(node.type)
 
-  RAMP_TABLE_SIZE = 256
+def set_mapped(xn, name, table, value):
+    """Like the switch statements in add_node(): unknown values keep the Cycles default."""
+    if value in table:
+        xn.set(name, table[value])
 
-  if b_node_is_a(cycles_node, "RGBCurve"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeRGBCurve b_curve_node(b_node);
-    # BL::CurveMapping mapping(b_curve_node.mapping());
-    # RGBCurvesNode *curves = graph->create_node<RGBCurvesNode>();
-    # array<float3> curve_mapping_curves;
-    # float min_x, max_x;
-    curve_mapping_curves = curvemapping_color_to_array(node.mapping, RAMP_TABLE_SIZE, True)
-    min_x, max_x = curvemapping_minmax(node.mapping, 4)
-    # curves->set_min_x(min_x);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Min X", value=min_x, type="VALUE"))
-    # curves->set_max_x(max_x);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Max X", value=max_x, type="VALUE"))
-    # curves->set_curves(curve_mapping_curves);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Curves", value=curve_mapping_curves, type="FLOAT_ARRAY"))
-    # curves->set_extrapolate(mapping.extend() == mapping.extend_EXTRAPOLATED);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Extrapolate", value=(node.mapping.extend=="EXTRAPOLATED"), type="BOOLEAN"))
-    # node = curves;
-  
-  elif b_node_is_a(cycles_node, "VectorCurve"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeVectorCurve b_curve_node(b_node);
-    # BL::CurveMapping mapping(b_curve_node.mapping());
-    # VectorCurvesNode *curves = graph->create_node<VectorCurvesNode>();
-    # array<float3> curve_mapping_curves;
-    # float min_x, max_x;
-    curve_mapping_curves = curvemapping_color_to_array(node.mapping, RAMP_TABLE_SIZE, False)
-    min_x, max_x = curvemapping_minmax(node.mapping, 3)
-    # curves->set_min_x(min_x);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Min X", value=min_x, type="VALUE"))
-    # curves->set_max_x(max_x);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Max X", value=max_x, type="VALUE"))
-    # curves->set_curves(curve_mapping_curves);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Curves", value=curve_mapping_curves, type="FLOAT_ARRAY"))
-    # curves->set_extrapolate(mapping.extend() == mapping.extend_EXTRAPOLATED);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Extrapolate", value=(node.mapping.extend=="EXTRAPOLATED"), type="BOOLEAN"))
-    # node = curves;
-  
-  elif b_node_is_a(cycles_node, "FloatCurve"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeFloatCurve b_curve_node(b_node);
-    # BL::CurveMapping mapping(b_curve_node.mapping());
-    # FloatCurveNode *curve = graph->create_node<FloatCurveNode>();
-    # array<float> curve_mapping_curve;
-    # float min_x, max_x;
-    curve_mapping_curve = curvemapping_float_to_array(node.mapping, RAMP_TABLE_SIZE)
-    min_x, max_x = curvemapping_minmax(node.mapping, 1)
-    # curve->set_min_x(min_x);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Min X", value=min_x, type="VALUE"))
-    # curve->set_max_x(max_x);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Max X", value=max_x, type="VALUE"))
-    # curve->set_curve(curve_mapping_curve);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Curve", value=curve_mapping_curve, type="FLOAT_ARRAY"))
-    # curve->set_extrapolate(mapping.extend() == mapping.extend_EXTRAPOLATED);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Extrapolate", value=(node.mapping.extend=="EXTRAPOLATED"), type="BOOLEAN"))
-    # node = curve;
-  
-  elif b_node_is_a(cycles_node, "ValToRGB"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # RGBRampNode *ramp = graph->create_node<RGBRampNode>();
-    # BL::ShaderNodeValToRGB b_ramp_node(b_node);
-    # BL::ColorRamp b_color_ramp(b_ramp_node.color_ramp());
-    # array<float3> ramp_values;
-    # array<float> ramp_alpha;
-    ramp_values, ramp_alpha = colorramp_to_array(node.color_ramp, RAMP_TABLE_SIZE);
-    # ramp->set_ramp(ramp_values);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Ramp", value=ramp_values, type="FLOAT_ARRAY"))
-    # ramp->set_ramp_alpha(ramp_alpha);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Ramp Alpha", value=ramp_alpha, type="FLOAT_ARRAY"))
-    # 'EASE', 'CARDINAL', 'LINEAR', 'B_SPLINE', 'CONSTANT'
-    # ramp->set_interpolate(b_color_ramp.interpolation() != BL::ColorRamp::interpolation_CONSTANT);
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Interpolate", value=(node.color_ramp.interpolation!="CONSTANT"), type="BOOLEAN"))
-    # node = ramp;
-  
-  elif b_node_is_a(cycles_node, "RGB"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # ColorNode *color = graph->create_node<ColorNode>();
-    # color->set_value(get_node_output_rgba(b_node, "Color"));
-    # node = color;
-  elif b_node_is_a(cycles_node, "Value"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # ValueNode *value = graph->create_node<ValueNode>();
-    # value->set_value(get_node_output_value(b_node, "Value"));
-    # node = value;
-  elif b_node_is_a(cycles_node, "CameraData"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<CameraNode>();
-  elif b_node_is_a(cycles_node, "Invert"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<InvertNode>();
-  elif b_node_is_a(cycles_node, "Gamma"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<GammaNode>();
-  elif b_node_is_a(cycles_node, "BrightContrast"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<BrightContrastNode>();
-  elif b_node_is_a(cycles_node, "MixRGB"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeMixRGB b_mix_node(b_node);
-    # MixNode *mix = graph->create_node<MixNode>();
-    # mix->set_mix_type((NodeMix)b_mix_node.blend_type());
-    # mix->set_use_clamp(b_mix_node.use_clamp());
-    # node = mix;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Mix"):
-    #BL::ShaderNodeMix b_mix_node(b_node);
-    # ["MIX",                      "Mix",                     "Mix",                      [["MixVectorNode",              "mix_vector"],
-    #                                                                                      ["MixVectorNonUniformNode",    "mix_vector_non_uniform"],
-    #                                                                                      ["MixColorNode",               "mix_color"],
-    #                                                                                      ["MixFloatNode",               "mix_float"]]],    
-    #'FLOAT', 'VECTOR', 'RGBA'
-    if node.data_type == 'VECTOR':
-      #'UNIFORM', 'NON_UNIFORM'
-      if node.factor_mode == 'UNIFORM':
-        xml_node = xml_write_node_name(xml_root, node, cycles_node, cycles_type=0)
-        # MixVectorNode *mix_node = graph->create_node<MixVectorNode>();
-        # mix_node->set_use_clamp(b_mix_node.clamp_factor());
-        xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Use Clamp", value=node.clamp_factor, type="BOOLEAN"))
-        # node = mix_node;
-      else:
-        xml_node = xml_write_node_name(xml_root, node, cycles_node, cycles_type=1)
-        # MixVectorNonUniformNode *mix_node = graph->create_node<MixVectorNonUniformNode>();
-        # mix_node->set_use_clamp(b_mix_node.clamp_factor());
-        xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Use Clamp", value=node.clamp_factor, type="BOOLEAN"))
-        # node = mix_node;
-    elif node.data_type == 'RGBA':
-      xml_node = xml_write_node_name(xml_root, node, cycles_node, cycles_type=2)
-      #   MixColorNode *mix_node = graph->create_node<MixColorNode>();
-      #   mix_node->set_blend_type((NodeMix)b_mix_node.blend_type());
-      #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Blend Type", value=node.blend_type, type="ENUM"))
-      xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Blend Type", value=node.blend_type, value_name="blend_type")
-      #   mix_node->set_use_clamp(b_mix_node.clamp_factor());
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Use Clamp", value=node.clamp_factor, type="BOOLEAN"))
-      #   mix_node->set_use_clamp_result(b_mix_node.clamp_result());
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Use Clamp Result", value=node.clamp_result, type="BOOLEAN"))
-      #   node = mix_node;
+
+def h_rgb_curve(tree, n, xn):
+    xn.set("curves", curvemapping_color_to_array(n.mapping, RAMP_TABLE_SIZE, True))
+    min_x, max_x = curvemapping_minmax(n.mapping, 4)
+    xn.set("min_x", min_x)
+    xn.set("max_x", max_x)
+    xn.set("extrapolate", n.mapping.extend == 'EXTRAPOLATED')
+
+
+def h_vector_curve(tree, n, xn):
+    xn.set("curves", curvemapping_color_to_array(n.mapping, RAMP_TABLE_SIZE, False))
+    min_x, max_x = curvemapping_minmax(n.mapping, 3)
+    xn.set("min_x", min_x)
+    xn.set("max_x", max_x)
+    xn.set("extrapolate", n.mapping.extend == 'EXTRAPOLATED')
+
+
+def h_float_curve(tree, n, xn):
+    xn.set("curve", curvemapping_float_to_array(n.mapping, RAMP_TABLE_SIZE))
+    min_x, max_x = curvemapping_minmax(n.mapping, 1)
+    xn.set("min_x", min_x)
+    xn.set("max_x", max_x)
+    xn.set("extrapolate", n.mapping.extend == 'EXTRAPOLATED')
+
+
+def h_color_ramp(tree, n, xn):
+    ramp_values, ramp_alpha = colorramp_to_array(n.color_ramp, RAMP_TABLE_SIZE)
+    xn.set("ramp", ramp_values)
+    xn.set("ramp_alpha", ramp_alpha)
+    xn.set("interpolate", n.color_ramp.interpolation != 'CONSTANT')
+
+
+def h_rgb(tree, n, xn):
+    xn.set("value", socket_by_identifier(n.outputs, "Color").default_value)
+
+
+def h_input_vector(tree, n, xn):
+    xn.set("value", n.vector)
+
+
+def h_value(tree, n, xn):
+    xn.set("value", socket_by_identifier(n.outputs, "Value").default_value)
+
+
+def h_input_bool(tree, n, xn):
+    xn.set("value", 1.0 if n.boolean else 0.0)
+
+
+def h_input_int(tree, n, xn):
+    xn.set("value", float(n.integer))
+
+
+def h_mix_rgb(tree, n, xn):
+    xn.set("mix_type", enum_value(n, "blend_type"))
+    xn.set("use_clamp", n.use_clamp)
+
+
+def h_mix(tree, n, xn):
+    if xn.type.class_name == "MixColorNode":
+        xn.set("blend_type", enum_value(n, "blend_type"))
+        xn.set("use_clamp", n.clamp_factor)
+        xn.set("use_clamp_result", n.clamp_result)
     else:
-      xml_node = xml_write_node_name(xml_root, node, cycles_node, cycles_type=3)
-      #   MixFloatNode *mix_node = graph->create_node<MixFloatNode>();
-      #   mix_node->set_use_clamp(b_mix_node.clamp_factor());
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Use Clamp", value=node.clamp_factor, type="BOOLEAN"))
-      #   node = mix_node;
-  elif b_node_is_a(cycles_node, "SeparateRGB"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<SeparateRGBNode>();
-  elif b_node_is_a(cycles_node, "CombineRGB"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<CombineRGBNode>();
-  elif b_node_is_a(cycles_node, "SeparateHSV"):
-     xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<SeparateHSVNode>();
-  elif b_node_is_a(cycles_node, "CombineHSV"):
-     xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<CombineHSVNode>();
-  elif b_node_is_a(cycles_node, "SeparateColor"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeSeparateColor b_separate_node(b_node);
-    # SeparateColorNode *separate_node = graph->create_node<SeparateColorNode>();
-    # separate_node->set_color_type((NodeCombSepColorType)b_separate_node.mode());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Color Type", value=node.mode, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Color Type", value=node.mode, value_name="mode")
-    # node = separate_node;
-  elif b_node_is_a(cycles_node, "CombineColor"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeCombineColor b_combine_node(b_node);
-    # CombineColorNode *combine_node = graph->create_node<CombineColorNode>();
-    # combine_node->set_color_type((NodeCombSepColorType)b_combine_node.mode());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Color Type", value=node.mode, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Color Type", value=node.mode, value_name="mode")
-    # node = combine_node;
-  elif b_node_is_a(cycles_node, "SeparateXYZ"):
-     xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<SeparateXYZNode>();    
-  elif b_node_is_a(cycles_node, "CombineXYZ"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<CombineXYZNode>();    
-  elif b_node_is_a(cycles_node, "HueSaturation"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<HSVNode>();
-  elif b_node_is_a(cycles_node, "RGBToBW"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<RGBToBWNode>();   
-  elif b_node_is_a(cycles_node, "MapRange"):
-    # ["MAP_RANGE",                "MapRange",                "Map Range",                [["VectorMapRangeNode",         "vector_map_range"],
-    #                                                                                      ["MapRangeNode",               "map_range"]]],    
-    #BL::ShaderNodeMapRange b_map_range_node(b_node);
-    if node.data_type == 'FLOAT_VECTOR':
-      xml_node = xml_write_node_name(xml_root, node, cycles_node, cycles_type=0)
-      #   VectorMapRangeNode *vector_map_range_node = graph->create_node<VectorMapRangeNode>();
-      #   vector_map_range_node->set_use_clamp(b_map_range_node.clamp());
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Clamp", value=node.clamp, type="BOOLEAN"))
-      #   vector_map_range_node->set_range_type(
-      #       (NodeMapRangeType)b_map_range_node.interpolation_type());
-      #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Range Type", value=node.interpolation_type, type="ENUM"))
-      xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Range Type", value=node.interpolation_type, value_name="interpolation_type")
-      #   node = vector_map_range_node;
+        xn.set("use_clamp", n.clamp_factor)
+
+
+def h_color_type(tree, n, xn):
+    xn.set("color_type", enum_value(n, "mode"))
+
+
+def h_map_range(tree, n, xn):
+    if xn.type.class_name == "VectorMapRangeNode":
+        xn.set("use_clamp", n.clamp)
     else:
-      xml_node = xml_write_node_name(xml_root, node, cycles_node, cycles_type=1)
-      #   MapRangeNode *map_range_node = graph->create_node<MapRangeNode>();
-      #   map_range_node->set_clamp(b_map_range_node.clamp());
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Clamp", value=node.clamp, type="BOOLEAN"))
-      #   map_range_node->set_range_type((NodeMapRangeType)b_map_range_node.interpolation_type());
-      #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Range Type", value=node.interpolation_type, type="ENUM"))
-      xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Range Type", value=node.interpolation_type, value_name="interpolation_type")
-      #   node = map_range_node;
-  elif b_node_is_a(cycles_node, "Clamp"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeClamp b_clamp_node(b_node);
-    # ClampNode *clamp_node = graph->create_node<ClampNode>();
-    # clamp_node->set_clamp_type((NodeClampType)b_clamp_node.clamp_type());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Clamp Type", value=node.clamp_type, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Clamp Type", value=node.clamp_type, value_name="clamp_type")
-    # node = clamp_node;
-  elif b_node_is_a(cycles_node, "Math"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeMath b_math_node(b_node);
-    # MathNode *math_node = graph->create_node<MathNode>();
-    # math_node->set_math_type((NodeMathType)b_math_node.operation());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Math Type", value=node.operation, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Type", value=node.operation, value_name="operation")
+        xn.set("clamp", n.clamp)
+    xn.set("range_type", enum_value(n, "interpolation_type"))
 
-    # math_node->set_use_clamp(b_math_node.use_clamp());
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Use Clamp", value=node.use_clamp, type="BOOLEAN"))
-    # node = math_node;
-  elif b_node_is_a(cycles_node, "VectorMath"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeVectorMath b_vector_math_node(b_node);
-    # VectorMathNode *vector_math_node = graph->create_node<VectorMathNode>();
-    # vector_math_node->set_math_type((NodeVectorMathType)b_vector_math_node.operation());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Math Type", value=node.operation, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Math Type", value=node.operation, value_name="operation")
-    # node = vector_math_node;
-  elif b_node_is_a(cycles_node, "VectorRotate"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeVectorRotate b_vector_rotate_node(b_node);
-    # VectorRotateNode *vector_rotate_node = graph->create_node<VectorRotateNode>();
-    # vector_rotate_node->set_rotate_type(
-    #     (NodeVectorRotateType)b_vector_rotate_node.rotation_type());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Rotate Type", value=node.rotation_type, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Rotate Type", value=node.rotation_type, value_name="rotation_type")
-    # vector_rotate_node->set_invert(b_vector_rotate_node.invert());
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Invert", value=node.invert, type="BOOLEAN"))
-    # node = vector_rotate_node;
-  elif b_node_is_a(cycles_node, "VectorTransform"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeVectorTransform b_vector_transform_node(b_node);
-    # VectorTransformNode *vtransform = graph->create_node<VectorTransformNode>();
-    # vtransform->set_transform_type((NodeVectorTransformType)b_vector_transform_node.vector_type());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Transform Type", value=node.vector_type, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Transform Type", value=node.vector_type, value_name="vector_type")
-    # vtransform->set_convert_from(
-    #     (NodeVectorTransformConvertSpace)b_vector_transform_node.convert_from());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Convert From", value=node.convert_from, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Convert From", value=node.convert_from, value_name="convert_from")
-    # vtransform->set_convert_to(
-    #     (NodeVectorTransformConvertSpace)b_vector_transform_node.convert_to());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Convert To", value=node.convert_to, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Convert To", value=node.convert_to, value_name="convert_to")
-    # node = vtransform;
-  elif b_node_is_a(cycles_node, "Normal"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::Node::outputs_iterator out_it;
-    # b_node.outputs.begin(out_it);
 
-    # NormalNode *norm = graph->create_node<NormalNode>();
-    # norm->set_direction(get_node_output_vector(b_node, "Normal"));
-    # node = norm;
-  elif b_node_is_a(cycles_node, "Mapping"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeMapping b_mapping_node(b_node);
-    # MappingNode *mapping = graph->create_node<MappingNode>();
-    # mapping->set_mapping_type((NodeMappingType)b_mapping_node.vector_type());
-    #xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Mapping Type", value=node.vector_type, type="ENUM"))
-    xml_write_enum(writer_base=writer_base, xml_node=xml_node, node=node, id="Mapping Type", value=node.vector_type, value_name="vector_type")
-    # node = mapping;
-  elif b_node_is_a(cycles_node, "Fresnel"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<FresnelNode>();
-  elif b_node_is_a(cycles_node, "LayerWeight"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<LayerWeightNode>();
-  elif b_node_is_a(cycles_node, "AddShader"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<AddClosureNode>();
-  elif b_node_is_a(cycles_node, "MixShader"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<MixClosureNode>();
-  elif b_node_is_a(cycles_node, "Attribute"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeAttribute b_attr_node(b_node);
-    # AttributeNode *attr = graph->create_node<AttributeNode>();
-    # attr->set_attribute(blender_attribute_name_add_type(b_attr_node.attribute_name(),
-    #                                                     b_attr_node.attribute_type()));
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Attribute", value=blender_attribute_name_add_type(node.attribute_name,node.attribute_type), type="STRING"))
-    # node = attr;    
-  elif b_node_is_a(cycles_node, "Background"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<BackgroundNode>();
-  elif b_node_is_a(cycles_node, "Holdout"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<HoldoutNode>();
-  elif b_node_is_a(cycles_node, "BsdfDiffuse"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<DiffuseBsdfNode>();
-  elif b_node_is_a(cycles_node, "SubsurfaceScattering"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeSubsurfaceScattering b_subsurface_node(b_node);
+def h_clamp(tree, n, xn):
+    xn.set("clamp_type", enum_value(n, "clamp_type"))
 
-    # SubsurfaceScatteringNode *subsurface = graph->create_node<SubsurfaceScatteringNode>();
 
-    if node.falloff == 'BURLEY':
-    #   case BL::ShaderNodeSubsurfaceScattering::falloff_BURLEY:
-    #     subsurface->set_method(CLOSURE_BSSRDF_BURLEY_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Method", value='26', type="ENUM"))
-    #     break;
-    elif node.falloff == 'RANDOM_WALK':
-    #   case BL::ShaderNodeSubsurfaceScattering::falloff_RANDOM_WALK:
-    #     subsurface->set_method(CLOSURE_BSSRDF_RANDOM_WALK_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Method", value='27', type="ENUM"))
-    #     break;
-    elif node.falloff == 'RANDOM_WALK_SKIN':
-    #   case BL::ShaderNodeSubsurfaceScattering::falloff_RANDOM_WALK_SKIN:
-    #     subsurface->set_method(CLOSURE_BSSRDF_RANDOM_WALK_SKIN_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Method", value='28', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
+def h_math(tree, n, xn):
+    xn.set("math_type", enum_value(n, "operation"))
+    xn.set("use_clamp", n.use_clamp)
 
-    # node = subsurface;
-  elif b_node_is_a(cycles_node, "BsdfAnisotropic"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfAnisotropic b_glossy_node(b_node);
-    # GlossyBsdfNode *glossy = graph->create_node<GlossyBsdfNode>();
 
-    # switch (b_glossy_node.distribution("):
-    if node.distribution == 'BECKMANN':
-    #   case BL::ShaderNodeBsdfAnisotropic::distribution_BECKMANN:
-    #     glossy->set_distribution(CLOSURE_BSDF_MICROFACET_BECKMANN_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='9', type="ENUM"))
-    #     break;
-    elif node.distribution == 'GGX':
-    #   case BL::ShaderNodeBsdfAnisotropic::distribution_GGX:
-    #     glossy->set_distribution(CLOSURE_BSDF_MICROFACET_GGX_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='8', type="ENUM"))
-    #     break;
-    elif node.distribution == 'ASHIKHMIN_SHIRLEY':
-    #   case BL::ShaderNodeBsdfAnisotropic::distribution_ASHIKHMIN_SHIRLEY:
-    #     glossy->set_distribution(CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='11', type="ENUM"))
-    #     break;
-    elif node.distribution == 'MULTI_GGX':
-    #   case BL::ShaderNodeBsdfAnisotropic::distribution_MULTI_GGX:
-    #     glossy->set_distribution(CLOSURE_BSDF_MICROFACET_MULTI_GGX_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='10', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = glossy;
-  elif b_node_is_a(cycles_node, "BsdfGlass"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfGlass b_glass_node(b_node);
-    # GlassBsdfNode *glass = graph->create_node<GlassBsdfNode>();
-    # switch (b_glass_node.distribution("):
-    if node.distribution == 'BECKMANN':
-    #   case BL::ShaderNodeBsdfGlass::distribution_BECKMANN:
-    #     glass->set_distribution(CLOSURE_BSDF_MICROFACET_BECKMANN_GLASS_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='19', type="ENUM"))
-    #     break;
-    elif node.distribution == 'GGX':
-    #   case BL::ShaderNodeBsdfGlass::distribution_GGX:
-    #     glass->set_distribution(CLOSURE_BSDF_MICROFACET_GGX_GLASS_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='20', type="ENUM"))
-    #     break;
-    elif node.distribution == 'MULTI_GGX':
-    #   case BL::ShaderNodeBsdfGlass::distribution_MULTI_GGX:
-    #     glass->set_distribution(CLOSURE_BSDF_MICROFACET_MULTI_GGX_GLASS_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='21', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = glass;
-  elif b_node_is_a(cycles_node, "BsdfRefraction"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfRefraction b_refraction_node(b_node);
-    # RefractionBsdfNode *refraction = graph->create_node<RefractionBsdfNode>();
-    # switch (b_refraction_node.distribution("):
-    if node.distribution == 'BECKMANN':
-    #   case BL::ShaderNodeBsdfRefraction::distribution_BECKMANN:
-    #     refraction->set_distribution(CLOSURE_BSDF_MICROFACET_BECKMANN_REFRACTION_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='16', type="ENUM"))
-    #     break;
-    elif node.distribution == 'GGX':
-    #   case BL::ShaderNodeBsdfRefraction::distribution_GGX:
-    #     refraction->set_distribution(CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='17', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = refraction;
-  elif b_node_is_a(cycles_node, "BsdfToon"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfToon b_toon_node(b_node);
-    # ToonBsdfNode *toon = graph->create_node<ToonBsdfNode>();
-    # switch (b_toon_node.component("):
-    if node.component == 'DIFFUSE':
-    #   case BL::ShaderNodeBsdfToon::component_DIFFUSE:
-    #     toon->set_component(CLOSURE_BSDF_DIFFUSE_TOON_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Component", value='6', type="ENUM"))
-    #     break;
-    elif node.component == 'GLOSSY':
-    #   case BL::ShaderNodeBsdfToon::component_GLOSSY:
-    #     toon->set_component(CLOSURE_BSDF_GLOSSY_TOON_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Component", value='14', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = toon;
-  elif b_node_is_a(cycles_node, "BsdfHair"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfHair b_hair_node(b_node);
-    # HairBsdfNode *hair = graph->create_node<HairBsdfNode>();
-    # switch (b_hair_node.component("):
-    if node.component == 'Reflection':
-    #   case BL::ShaderNodeBsdfHair::component_Reflection:
-    #     hair->set_component(CLOSURE_BSDF_HAIR_REFLECTION_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Component", value='15', type="ENUM"))
-    #     break;
-    elif node.component == 'Transmission':
-    #   case BL::ShaderNodeBsdfHair::component_Transmission:
-    #     hair->set_component(CLOSURE_BSDF_HAIR_TRANSMISSION_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Component", value='18', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = hair;
-  elif b_node_is_a(cycles_node, "BsdfHairPrincipled"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfHairPrincipled b_principled_hair_node(b_node);
-    # PrincipledHairBsdfNode *principled_hair = graph->create_node<PrincipledHairBsdfNode>();    
-    # principled_hair->set_model((NodePrincipledHairModel)get_enum(b_principled_hair_node.ptr,
-    #                                                              "model",
-    #                                                              NODE_PRINCIPLED_HAIR_MODEL_NUM,
-    #                                                              NODE_PRINCIPLED_HAIR_HUANG));
-    if node.model == 'CHIANG':
-       xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Model", value='0', type="ENUM"))
-    elif node.model == 'HUANG':
-       xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Model", value='1', type="ENUM"))
-    # principled_hair->set_parametrization(
-    #     (NodePrincipledHairParametrization)get_enum(b_principled_hair_node.ptr,
-    #                                                 "parametrization",
-    #                                                 NODE_PRINCIPLED_HAIR_PARAMETRIZATION_NUM,
-    #                                                 NODE_PRINCIPLED_HAIR_REFLECTANCE));
+def h_math_type(tree, n, xn):
+    xn.set("math_type", enum_value(n, "operation"))
 
-    if node.parametrization == 'ABSORPTION':
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Parametrization", value='0', type="ENUM"))
-    elif node.parametrization == 'MELANIN':
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Parametrization", value='1', type="ENUM"))
-    elif node.parametrization == 'COLOR':
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Parametrization", value='2', type="ENUM"))
 
-    # node = principled_hair;
-  elif b_node_is_a(cycles_node, "BsdfPrincipled"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfPrincipled b_principled_node(b_node);
-    # PrincipledBsdfNode *principled = graph->create_node<PrincipledBsdfNode>();
-    # switch (b_principled_node.distribution("):
-    if node.distribution == 'GGX':
-    #   case BL::ShaderNodeBsdfPrincipled::distribution_GGX:
-    #     principled->set_distribution(CLOSURE_BSDF_MICROFACET_GGX_GLASS_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='20', type="ENUM"))
-    #     break;
-    elif node.distribution == 'MULTI_GGX':
-    #   case BL::ShaderNodeBsdfPrincipled::distribution_MULTI_GGX:
-    #     principled->set_distribution(CLOSURE_BSDF_MICROFACET_MULTI_GGX_GLASS_ID);
-    #     break;
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='21', type="ENUM"))
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    
-    # switch (b_principled_node.subsurface_method("):
-    if node.subsurface_method == 'BURLEY':
-    #   case BL::ShaderNodeBsdfPrincipled::subsurface_method_BURLEY:
-    #     principled->set_subsurface_method(CLOSURE_BSSRDF_BURLEY_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Subsurface Method", value='26', type="ENUM"))
-    #     break;
-    elif node.subsurface_method == 'RANDOM_WALK':
-    #   case BL::ShaderNodeBsdfPrincipled::subsurface_method_RANDOM_WALK:
-    #     principled->set_subsurface_method(CLOSURE_BSSRDF_RANDOM_WALK_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Subsurface Method", value='27', type="ENUM"))
-    #     break;
-    elif node.subsurface_method == 'RANDOM_WALK_SKIN':
-    #   case BL::ShaderNodeBsdfPrincipled::subsurface_method_RANDOM_WALK_SKIN:
-    #     principled->set_subsurface_method(CLOSURE_BSSRDF_RANDOM_WALK_SKIN_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Subsurface Method", value='28', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = principled;
-  elif b_node_is_a(cycles_node, "BsdfTranslucent"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<TranslucentBsdfNode>();
-  elif b_node_is_a(cycles_node, "BsdfTransparent"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<TransparentBsdfNode>();
-  elif b_node_is_a(cycles_node, "BsdfRayPortal"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<RayPortalBsdfNode>();
-  elif b_node_is_a(cycles_node, "BsdfSheen"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBsdfSheen b_sheen_node(b_node);
-    # SheenBsdfNode *sheen = graph->create_node<SheenBsdfNode>();
-    # switch (b_sheen_node.distribution("):
-    if node.distribution == 'ASHIKHMIN':
-    #   case BL::ShaderNodeBsdfSheen::distribution_ASHIKHMIN:
-    #     sheen->set_distribution(CLOSURE_BSDF_ASHIKHMIN_VELVET_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='12', type="ENUM"))
-    #     break;
-    elif node.distribution == 'MICROFIBER':
-    #   case BL::ShaderNodeBsdfSheen::distribution_MICROFIBER:
-    #     sheen->set_distribution(CLOSURE_BSDF_SHEEN_ID);
-      xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Distribution", value='5', type="ENUM"))
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = sheen;
-  elif b_node_is_a(cycles_node, "Emission"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<EmissionNode>();
-  elif b_node_is_a(cycles_node, "AmbientOcclusion"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeAmbientOcclusion b_ao_node(b_node);
-    # AmbientOcclusionNode *ao = graph->create_node<AmbientOcclusionNode>();
-    # ao->set_samples(b_ao_node.samples());
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Samples", value=node.samples, type="INT"))
-    # ao->set_inside(b_ao_node.inside());
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Inside", value=node.inside, type="BOOLEAN"))
-    # ao->set_only_local(b_ao_node.only_local());
-    xml_write_socket(writer_base, xml_node, node, CustomSocket(id="Only Local", value=node.only_local, type="BOOLEAN"))
-    # node = ao;
-  elif b_node_is_a(cycles_node, "VolumeScatter"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<ScatterVolumeNode>();
-  elif b_node_is_a(cycles_node, "VolumeAbsorption"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    #node = graph->create_node<AbsorptionVolumeNode>();
-  elif b_node_is_a(cycles_node, "VolumePrincipled"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # PrincipledVolumeNode *principled = graph->create_node<PrincipledVolumeNode>();
-    # node = principled;
-  elif b_node_is_a(cycles_node, "NewGeometry"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<GeometryNode>();
-  elif b_node_is_a(cycles_node, "Wireframe"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeWireframe b_wireframe_node(b_node);
-    # WireframeNode *wire = graph->create_node<WireframeNode>();
-    # wire->set_use_pixel_size(b_wireframe_node.use_pixel_size());
-    # node = wire;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Wavelength"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<WavelengthNode>();
-  elif b_node_is_a(cycles_node, "Blackbody"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<BlackbodyNode>();
-  elif b_node_is_a(cycles_node, "LightPath"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<LightPathNode>();
-  elif b_node_is_a(cycles_node, "LightFalloff"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<LightFalloffNode>();
-  elif b_node_is_a(cycles_node, "ObjectInfo"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<ObjectInfoNode>();
-  elif b_node_is_a(cycles_node, "ParticleInfo"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<ParticleInfoNode>();
-  elif b_node_is_a(cycles_node, "HairInfo"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<HairInfoNode>();    
-  elif b_node_is_a(cycles_node, "PointInfo"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<PointInfoNode>();
-  elif b_node_is_a(cycles_node, "VolumeInfo"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # node = graph->create_node<VolumeInfoNode>();
-  elif b_node_is_a(cycles_node, "VertexColor"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeVertexColor b_vertex_color_node(b_node);
-    # VertexColorNode *vertex_color_node = graph->create_node<VertexColorNode>();
-    # vertex_color_node->set_layer_name(ustring(b_vertex_color_node.layer_name()));
-    # node = vertex_color_node;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Bump"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBump b_bump_node(b_node);
-    # BumpNode *bump = graph->create_node<BumpNode>();
-    # bump->set_invert(b_bump_node.invert());
-    # node = bump;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Script"):
-# #ifdef WITH_OSL
-#     if (scene->shader_manager->use_osl("):
-#       /* create script node */
-#       BL::ShaderNodeScript b_script_node(b_node);
+def h_vector_rotate(tree, n, xn):
+    xn.set("rotate_type", enum_value(n, "rotation_type"))
+    xn.set("invert", n.invert)
 
-#       ShaderManager *manager = scene->shader_manager;
-#       string bytecode_hash = b_script_node.bytecode_hash();
 
-#       if (!bytecode_hash.empty("):
-#         node = OSLShaderManager::osl_node(
-#             graph, manager, "", bytecode_hash, b_script_node.bytecode());
-#         print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-#       else {
-#         string absolute_filepath = blender_absolute_path(
-#             b_data, b_ntree, b_script_node.filepath());
-#         node = OSLShaderManager::osl_node(graph, manager, absolute_filepath, "");
-#         print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-#       print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-# #else
-#     (void)b_data;
-#     (void)b_ntree;
-# #endif
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexImage"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexImage b_image_node(b_node);
-    # BL::Image b_image(b_image_node.image());
-    # BL::ImageUser b_image_user(b_image_node.image_user());
-    # ImageTextureNode *image = graph->create_node<ImageTextureNode>();
+def h_vector_transform(tree, n, xn):
+    xn.set("transform_type", enum_value(n, "vector_type"))
+    xn.set("convert_from", enum_value(n, "convert_from"))
+    xn.set("convert_to", enum_value(n, "convert_to"))
 
-    # image->set_interpolation(get_image_interpolation(b_image_node));
-    # image->set_extension(get_image_extension(b_image_node));
-    # image->set_projection((NodeImageProjection)b_image_node.projection());
-    # image->set_projection_blend(b_image_node.projection_blend());
-    # BL::TexMapping b_texture_mapping(b_image_node.texture_mapping());
-    # get_tex_mapping(image, b_texture_mapping);
 
-    # if (b_image) {
-    #   BL::Image::source_enum b_image_source = b_image.source();
-    #   PointerRNA colorspace_ptr = b_image.colorspace_settings().ptr;
-    #   image->set_colorspace(ustring(get_enum_identifier(colorspace_ptr, "name")));
+def h_normal(tree, n, xn):
+    xn.set("direction", socket_by_identifier(n.outputs, "Normal").default_value)
 
-    #   image->set_animated(is_image_animated(b_image_source, b_image_user));
-    #   image->set_alpha_type(get_image_alpha_type(b_image));
 
-    #   array<int> tiles;
-    #   for (BL::UDIMTile &b_tile : b_image.tiles) {
-    #     tiles.push_back_slow(b_tile.number());
-    #     print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #   image->set_tiles(tiles);
+def h_mapping(tree, n, xn):
+    xn.set("mapping_type", enum_value(n, "vector_type"))
 
-    #   /* builtin images will use callback-based reading because
-    #    * they could only be loaded correct from blender side
-    #    */
-    #   bool is_builtin = b_image.packed_file() || b_image_source == BL::Image::source_GENERATED ||
-    #                     b_image_source == BL::Image::source_MOVIE ||
-    #                     (b_engine.is_preview() && b_image_source != BL::Image::source_SEQUENCE);
 
-    #   if (is_builtin) {
-    #     /* for builtin images we're using image datablock name to find an image to
-    #      * read pixels from later
-    #      *
-    #      * also store frame number as well, so there's no differences in handling
-    #      * builtin names for packed images and movies
-    #      */
-    #     int scene_frame = b_scene.frame_current();
-    #     int image_frame = image_user_frame_number(b_image_user, b_image, scene_frame);
-    #     if (b_image_source != BL::Image::source_TILED) {
-    #       image->handle = scene->image_manager->add_image(
-    #           new BlenderImageLoader(b_image, image_frame, 0, b_engine.is_preview()),
-    #           image->image_params());
-    #       print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #     else {
-    #       vector<ImageLoader *> loaders;
-    #       loaders.reserve(image->get_tiles().size());
-    #       for (int tile_number : image->get_tiles("):
-    #         loaders.push_back(
-    #             new BlenderImageLoader(b_image, image_frame, tile_number, b_engine.is_preview()));
-    #         print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
+def h_attribute(tree, n, xn):
+    xn.set("attribute", blender_attribute_name_add_type(n.attribute_name, n.attribute_type))
 
-    #       image->handle = scene->image_manager->add_image(loaders, image->image_params());
-    #       print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #     print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #   else {
-    #     ustring filename = ustring(
-    #         image_user_file_path(b_data, b_image_user, b_image, b_scene.frame_current()));
-    #     image->set_filename(filename);
-    #     print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = image;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexEnvironment"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexEnvironment b_env_node(b_node);
-    # BL::Image b_image(b_env_node.image());
-    # BL::ImageUser b_image_user(b_env_node.image_user());
-    # EnvironmentTextureNode *env = graph->create_node<EnvironmentTextureNode>();
 
-    # env->set_interpolation(get_image_interpolation(b_env_node));
-    # env->set_projection((NodeEnvironmentProjection)b_env_node.projection());
-    # BL::TexMapping b_texture_mapping(b_env_node.texture_mapping());
-    # get_tex_mapping(env, b_texture_mapping);
+def h_subsurface(tree, n, xn):
+    set_mapped(xn, "method", SUBSURFACE_METHOD, n.falloff)
 
-    # if (b_image) {
-    #   BL::Image::source_enum b_image_source = b_image.source();
-    #   PointerRNA colorspace_ptr = b_image.colorspace_settings().ptr;
-    #   env->set_colorspace(ustring(get_enum_identifier(colorspace_ptr, "name")));
-    #   env->set_animated(is_image_animated(b_image_source, b_image_user));
-    #   env->set_alpha_type(get_image_alpha_type(b_image));
 
-    #   bool is_builtin = b_image.packed_file() || b_image_source == BL::Image::source_GENERATED ||
-    #                     b_image_source == BL::Image::source_MOVIE ||
-    #                     (b_engine.is_preview() && b_image_source != BL::Image::source_SEQUENCE);
+def h_metallic(tree, n, xn):
+    set_mapped(xn, "distribution", METALLIC_DISTRIBUTION, n.distribution)
+    set_mapped(xn, "fresnel_type", METALLIC_FRESNEL, n.fresnel_type)
 
-    #   if (is_builtin) {
-    #     int scene_frame = b_scene.frame_current();
-    #     int image_frame = image_user_frame_number(b_image_user, b_image, scene_frame);
-    #     env->handle = scene->image_manager->add_image(
-    #         new BlenderImageLoader(b_image, image_frame, 0, b_engine.is_preview()),
-    #         env->image_params());
-    #     print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #   else {
-    #     env->set_filename(
-    #         ustring(image_user_file_path(b_data, b_image_user, b_image, b_scene.frame_current())));
-    #     print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = env;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexGradient"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexGradient b_gradient_node(b_node);
-    # GradientTextureNode *gradient = graph->create_node<GradientTextureNode>();
-    # gradient->set_gradient_type((NodeGradientType)b_gradient_node.gradient_type());
-    # BL::TexMapping b_texture_mapping(b_gradient_node.texture_mapping());
-    # get_tex_mapping(gradient, b_texture_mapping);
-    # node = gradient;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexVoronoi"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexVoronoi b_voronoi_node(b_node);
-    # VoronoiTextureNode *voronoi = graph->create_node<VoronoiTextureNode>();
-    # voronoi->set_dimensions(b_voronoi_node.voronoi_dimensions());
-    # voronoi->set_feature((NodeVoronoiFeature)b_voronoi_node.feature());
-    # voronoi->set_metric((NodeVoronoiDistanceMetric)b_voronoi_node.distance());
-    # voronoi->set_use_normalize(b_voronoi_node.normalize());
-    # BL::TexMapping b_texture_mapping(b_voronoi_node.texture_mapping());
-    # get_tex_mapping(voronoi, b_texture_mapping);
-    # node = voronoi;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexMagic"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexMagic b_magic_node(b_node);
-    # MagicTextureNode *magic = graph->create_node<MagicTextureNode>();
-    # magic->set_depth(b_magic_node.turbulence_depth());
-    # BL::TexMapping b_texture_mapping(b_magic_node.texture_mapping());
-    # get_tex_mapping(magic, b_texture_mapping);
-    # node = magic;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexWave"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexWave b_wave_node(b_node);
-    # WaveTextureNode *wave = graph->create_node<WaveTextureNode>();
-    # wave->set_wave_type((NodeWaveType)b_wave_node.wave_type());
-    # wave->set_bands_direction((NodeWaveBandsDirection)b_wave_node.bands_direction());
-    # wave->set_rings_direction((NodeWaveRingsDirection)b_wave_node.rings_direction());
-    # wave->set_profile((NodeWaveProfile)b_wave_node.wave_profile());
-    # BL::TexMapping b_texture_mapping(b_wave_node.texture_mapping());
-    # get_tex_mapping(wave, b_texture_mapping);
-    # node = wave;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexChecker"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexChecker b_checker_node(b_node);
-    # CheckerTextureNode *checker = graph->create_node<CheckerTextureNode>();
-    # BL::TexMapping b_texture_mapping(b_checker_node.texture_mapping());
-    # get_tex_mapping(checker, b_texture_mapping);
-    # node = checker;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexBrick"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexBrick b_brick_node(b_node);
-    # BrickTextureNode *brick = graph->create_node<BrickTextureNode>();
-    # brick->set_offset(b_brick_node.offset());
-    # brick->set_offset_frequency(b_brick_node.offset_frequency());
-    # brick->set_squash(b_brick_node.squash());
-    # brick->set_squash_frequency(b_brick_node.squash_frequency());
-    # BL::TexMapping b_texture_mapping(b_brick_node.texture_mapping());
-    # get_tex_mapping(brick, b_texture_mapping);
-    # node = brick;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexNoise"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexNoise b_noise_node(b_node);
-    # NoiseTextureNode *noise = graph->create_node<NoiseTextureNode>();
-    # noise->set_dimensions(b_noise_node.noise_dimensions());
-    # noise->set_type((NodeNoiseType)b_noise_node.noise_type());
-    # noise->set_use_normalize(b_noise_node.normalize());
-    # BL::TexMapping b_texture_mapping(b_noise_node.texture_mapping());
-    # get_tex_mapping(noise, b_texture_mapping);
-    # node = noise;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexCoord"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexCoord b_tex_coord_node(b_node);
-    # TextureCoordinateNode *tex_coord = graph->create_node<TextureCoordinateNode>();
-    # tex_coord->set_from_dupli(b_tex_coord_node.from_instancer());
-    # if (b_tex_coord_node.object("):
-    #   tex_coord->set_use_transform(true);
-    #   tex_coord->set_ob_tfm(get_transform(b_tex_coord_node.object().matrix_world()));
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = tex_coord;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexSky"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexSky b_sky_node(b_node);
-    # SkyTextureNode *sky = graph->create_node<SkyTextureNode>();
-    # sky->set_sky_type((NodeSkyType)b_sky_node.sky_type());
-    # sky->set_sun_direction(normalize(get_float3(b_sky_node.sun_direction())));
-    # sky->set_turbidity(b_sky_node.turbidity());
-    # sky->set_ground_albedo(b_sky_node.ground_albedo());
-    # sky->set_sun_disc(b_sky_node.sun_disc());
-    # sky->set_sun_size(b_sky_node.sun_size());
-    # sky->set_sun_intensity(b_sky_node.sun_intensity());
-    # sky->set_sun_elevation(b_sky_node.sun_elevation());
-    # sky->set_sun_rotation(b_sky_node.sun_rotation());
-    # sky->set_altitude(b_sky_node.altitude());
-    # sky->set_air_density(b_sky_node.air_density());
-    # sky->set_dust_density(b_sky_node.dust_density());
-    # sky->set_ozone_density(b_sky_node.ozone_density());
-    # BL::TexMapping b_texture_mapping(b_sky_node.texture_mapping());
-    # get_tex_mapping(sky, b_texture_mapping);
-    # node = sky;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexIES"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexIES b_ies_node(b_node);
-    # IESLightNode *ies = graph->create_node<IESLightNode>();
-    # switch (b_ies_node.mode("):
-    #   case BL::ShaderNodeTexIES::mode_EXTERNAL:
-    #     ies->set_filename(ustring(blender_absolute_path(b_data, b_ntree, b_ies_node.filepath())));
-    #     break;
-    #   case BL::ShaderNodeTexIES::mode_INTERNAL:
-    #     ustring ies_content = ustring(get_text_datablock_content(b_ies_node.ies().ptr));
-    #     if (ies_content.empty("):
-    #       ies_content = "\n";
-    #       print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    #     ies->set_ies(ies_content);
-    #     break;
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    # node = ies;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexWhiteNoise"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexWhiteNoise b_tex_white_noise_node(b_node);
-    # WhiteNoiseTextureNode *white_noise_node = graph->create_node<WhiteNoiseTextureNode>();
-    # white_noise_node->set_dimensions(b_tex_white_noise_node.noise_dimensions());
-    # node = white_noise_node;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "NormalMap"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeNormalMap b_normal_map_node(b_node);
-    # NormalMapNode *nmap = graph->create_node<NormalMapNode>();
-    # nmap->set_space((NodeNormalMapSpace)b_normal_map_node.space());
-    # nmap->set_attribute(ustring(b_normal_map_node.uv_map()));
-    # node = nmap;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Tangent"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTangent b_tangent_node(b_node);
-    # TangentNode *tangent = graph->create_node<TangentNode>();
-    # tangent->set_direction_type((NodeTangentDirectionType)b_tangent_node.direction_type());
-    # tangent->set_axis((NodeTangentAxis)b_tangent_node.axis());
-    # tangent->set_attribute(ustring(b_tangent_node.uv_map()));
-    # node = tangent;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "UVMap"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeUVMap b_uvmap_node(b_node);
-    # UVMapNode *uvm = graph->create_node<UVMapNode>();
-    # uvm->set_attribute(ustring(b_uvmap_node.uv_map()));
-    # uvm->set_from_dupli(b_uvmap_node.from_instancer());
-    # node = uvm;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "TexPointDensity"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeTexPointDensity b_point_density_node(b_node);
-    # PointDensityTextureNode *point_density = graph->create_node<PointDensityTextureNode>();
-    # point_density->set_space((NodeTexVoxelSpace)b_point_density_node.space());
-    # point_density->set_interpolation(get_image_interpolation(b_point_density_node));
-    # point_density->handle = scene->image_manager->add_image(
-    #     new BlenderPointDensityLoader(b_depsgraph, b_point_density_node),
-    #     point_density->image_params());
 
-    # b_point_density_node.cache_point_density(b_depsgraph);
-    # node = point_density;
+def h_glossy(tree, n, xn):
+    set_mapped(xn, "distribution", GLOSSY_DISTRIBUTION, n.distribution)
 
-    # /* Transformation form world space to texture space.
-    #  *
-    #  * NOTE: Do this after the texture is cached, this is because getting
-    #  * min/max will need to access this cache.
-    #  */
-    # BL::Object b_ob(b_point_density_node.object());
-    # if (b_ob) {
-    #   float3 loc, size;
-    #   point_density_texture_space(b_depsgraph, b_point_density_node, loc, size);
-    #   point_density->set_tfm(transform_translate(-loc) * transform_scale(size) *
-    #                          transform_inverse(get_transform(b_ob.matrix_world())));
-    #   print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Bevel"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeBevel b_bevel_node(b_node);
-    # BevelNode *bevel = graph->create_node<BevelNode>();
-    # bevel->set_samples(b_bevel_node.samples());
-    # node = bevel;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "Displacement"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeDisplacement b_disp_node(b_node);
-    # DisplacementNode *disp = graph->create_node<DisplacementNode>();
-    # disp->set_space((NodeNormalMapSpace)b_disp_node.space());
-    # node = disp;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "VectorDisplacement"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeVectorDisplacement b_disp_node(b_node);
-    # VectorDisplacementNode *disp = graph->create_node<VectorDisplacementNode>();
-    # disp->set_space((NodeNormalMapSpace)b_disp_node.space());
-    # disp->set_attribute(ustring(""));
-    # node = disp;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
-  elif b_node_is_a(cycles_node, "OutputAOV"):
-    xml_node = xml_write_node_name(xml_root, node, cycles_node)
-    # BL::ShaderNodeOutputAOV b_aov_node(b_node);
-    # OutputAOVNode *aov = graph->create_node<OutputAOVNode>();
-    # aov->set_name(ustring(b_aov_node.aov_name()));
-    # node = aov;
-    print("Not implemented: ", cycles_node[braas_hpc_xmlmaterial_map.StructName])
 
-  return xml_node
+def h_glass(tree, n, xn):
+    set_mapped(xn, "distribution", GLASS_DISTRIBUTION, n.distribution)
+
+
+def h_refraction(tree, n, xn):
+    set_mapped(xn, "distribution", REFRACTION_DISTRIBUTION, n.distribution)
+
+
+def h_toon(tree, n, xn):
+    set_mapped(xn, "component", TOON_COMPONENT, n.component)
+
+
+def h_hair(tree, n, xn):
+    set_mapped(xn, "component", HAIR_COMPONENT, n.component)
+
+
+def h_principled_hair(tree, n, xn):
+    # NODE_PRINCIPLED_HAIR_MODEL_NUM = 2, NODE_PRINCIPLED_HAIR_HUANG = 1
+    xn.set("model", validate_enum_value(enum_value(n, "model"), 2, 1))
+    # NODE_PRINCIPLED_HAIR_PARAMETRIZATION_NUM = 3, NODE_PRINCIPLED_HAIR_REFLECTANCE = 0
+    xn.set("parametrization", validate_enum_value(enum_value(n, "parametrization"), 3, 0))
+
+
+def h_principled(tree, n, xn):
+    set_mapped(xn, "distribution", PRINCIPLED_DISTRIBUTION, n.distribution)
+    set_mapped(xn, "subsurface_method", SUBSURFACE_METHOD, n.subsurface_method)
+
+
+def h_sheen(tree, n, xn):
+    set_mapped(xn, "distribution", SHEEN_DISTRIBUTION, n.distribution)
+
+
+def h_ambient_occlusion(tree, n, xn):
+    xn.set("samples", n.samples)
+    xn.set("inside", n.inside)
+    xn.set("only_local", n.only_local)
+
+
+def h_volume_phase(tree, n, xn):
+    set_mapped(xn, "phase", VOLUME_PHASE, n.phase)
+
+
+def h_wireframe(tree, n, xn):
+    xn.set("use_pixel_size", n.use_pixel_size)
+
+
+def h_vertex_color(tree, n, xn):
+    xn.set("layer_name", n.layer_name)
+
+
+def h_bump(tree, n, xn):
+    xn.set("invert", n.invert)
+
+
+def h_image(tree, n, xn):
+    # INTERPOLATION_NUM_TYPES = 4, EXTENSION_NUM_TYPES = 4, linear / repeat by default.
+    xn.set("interpolation", validate_enum_value(enum_value(n, "interpolation"), 4, 0))
+    xn.set("extension", validate_enum_value(enum_value(n, "extension"), 4, 0))
+    xn.set("projection", enum_value(n, "projection"))
+    xn.set("projection_blend", n.projection_blend)
+    get_tex_mapping(xn, n.texture_mapping)
+    if n.image:
+        set_image(xn, n, n.image, n.image_user, use_tiles=True)
+
+
+def h_environment(tree, n, xn):
+    xn.set("interpolation", validate_enum_value(enum_value(n, "interpolation"), 4, 0))
+    xn.set("projection", enum_value(n, "projection"))
+    get_tex_mapping(xn, n.texture_mapping)
+    if n.image:
+        set_image(xn, n, n.image, n.image_user, use_tiles=False)
+
+
+def h_gradient(tree, n, xn):
+    xn.set("gradient_type", enum_value(n, "gradient_type"))
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_voronoi(tree, n, xn):
+    xn.set("dimensions", enum_value(n, "voronoi_dimensions"))
+    xn.set("feature", enum_value(n, "feature"))
+    xn.set("metric", enum_value(n, "distance"))
+    xn.set("use_normalize", n.normalize)
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_magic(tree, n, xn):
+    xn.set("depth", n.turbulence_depth)
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_wave(tree, n, xn):
+    xn.set("wave_type", enum_value(n, "wave_type"))
+    xn.set("bands_direction", enum_value(n, "bands_direction"))
+    xn.set("rings_direction", enum_value(n, "rings_direction"))
+    xn.set("profile", enum_value(n, "wave_profile"))
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_checker(tree, n, xn):
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_brick(tree, n, xn):
+    xn.set("offset", n.offset)
+    xn.set("offset_frequency", n.offset_frequency)
+    xn.set("squash", n.squash)
+    xn.set("squash_frequency", n.squash_frequency)
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_noise(tree, n, xn):
+    xn.set("dimensions", enum_value(n, "noise_dimensions"))
+    xn.set("type", enum_value(n, "noise_type"))
+    xn.set("use_normalize", n.normalize)
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_gabor(tree, n, xn):
+    xn.set("type", enum_value(n, "gabor_type"))
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_tex_coord(tree, n, xn):
+    xn.set("from_dupli", n.from_instancer)
+    if n.object:
+        xn.set("use_transform", True)
+        xn.set("ob_tfm", transform_rows(n.object.matrix_world))
+
+
+def h_sky(tree, n, xn):
+    xn.set("sky_type", enum_value(n, "sky_type"))
+    direction = [float(v) for v in n.sun_direction]
+    length = math.sqrt(sum(v * v for v in direction))
+    if length > 0.0:
+        direction = [v / length for v in direction]
+    xn.set("sun_direction", direction)
+    xn.set("turbidity", n.turbidity)
+    xn.set("ground_albedo", n.ground_albedo)
+    xn.set("sun_disc", n.sun_disc)
+    xn.set("sun_size", n.sun_size)
+    xn.set("sun_intensity", n.sun_intensity)
+    xn.set("sun_elevation", n.sun_elevation)
+    xn.set("sun_rotation", n.sun_rotation)
+    xn.set("altitude", n.altitude)
+    xn.set("air_density", n.air_density)
+    xn.set("aerosol_density", n.aerosol_density)
+    xn.set("ozone_density", n.ozone_density)
+    get_tex_mapping(xn, n.texture_mapping)
+
+
+def h_ies(tree, n, xn):
+    if n.mode == 'EXTERNAL':
+        xn.set("filename", blender_absolute_path(tree, n.filepath))
+    elif n.mode == 'INTERNAL':
+        xn.set("ies", n.ies.as_string() if n.ies else "")
+
+
+def h_white_noise(tree, n, xn):
+    xn.set("dimensions", enum_value(n, "noise_dimensions"))
+
+
+def h_normal_map(tree, n, xn):
+    xn.set("space", enum_value(n, "space"))
+    xn.set("attribute", n.uv_map)
+    xn.set("convention", enum_value(n, "convention"))
+    xn.set("base", enum_value(n, "base"))
+
+
+def h_radial_tiling(tree, n, xn):
+    xn.set("use_normalize", n.normalize)
+
+
+def h_tangent(tree, n, xn):
+    xn.set("direction_type", enum_value(n, "direction_type"))
+    xn.set("axis", enum_value(n, "axis"))
+    xn.set("attribute", n.uv_map)
+
+
+def h_uvmap(tree, n, xn):
+    xn.set("attribute", n.uv_map)
+    xn.set("from_dupli", n.from_instancer)
+
+
+def h_bevel(tree, n, xn):
+    xn.set("samples", n.samples)
+
+
+def h_displacement(tree, n, xn):
+    xn.set("space", enum_value(n, "space"))
+
+
+def h_vector_displacement(tree, n, xn):
+    xn.set("space", enum_value(n, "space"))
+    xn.set("attribute", "")
+
+
+def h_aov(tree, n, xn):
+    xn.set("name", n.aov_name)
+
+
+def h_raycast(tree, n, xn):
+    xn.set("only_local", n.only_local)
+
+
+NODE_HANDLERS = {
+    "ShaderNodeRGBCurve": h_rgb_curve,
+    "ShaderNodeVectorCurve": h_vector_curve,
+    "ShaderNodeFloatCurve": h_float_curve,
+    "ShaderNodeValToRGB": h_color_ramp,
+    "ShaderNodeRGB": h_rgb,
+    "FunctionNodeInputVector": h_input_vector,
+    "ShaderNodeValue": h_value,
+    "FunctionNodeInputBool": h_input_bool,
+    "FunctionNodeInputInt": h_input_int,
+    "ShaderNodeMixRGB": h_mix_rgb,
+    "ShaderNodeMix": h_mix,
+    "ShaderNodeSeparateColor": h_color_type,
+    "ShaderNodeCombineColor": h_color_type,
+    "ShaderNodeMapRange": h_map_range,
+    "ShaderNodeClamp": h_clamp,
+    "ShaderNodeMath": h_math,
+    "FunctionNodeBooleanMath": h_math_type,
+    "FunctionNodeIntegerMath": h_math_type,
+    "ShaderNodeVectorMath": h_math_type,
+    "ShaderNodeVectorRotate": h_vector_rotate,
+    "ShaderNodeVectorTransform": h_vector_transform,
+    "ShaderNodeNormal": h_normal,
+    "ShaderNodeMapping": h_mapping,
+    "ShaderNodeAttribute": h_attribute,
+    "ShaderNodeSubsurfaceScattering": h_subsurface,
+    "ShaderNodeBsdfMetallic": h_metallic,
+    "ShaderNodeBsdfAnisotropic": h_glossy,
+    "ShaderNodeBsdfGlass": h_glass,
+    "ShaderNodeBsdfRefraction": h_refraction,
+    "ShaderNodeBsdfToon": h_toon,
+    "ShaderNodeBsdfHair": h_hair,
+    "ShaderNodeBsdfHairPrincipled": h_principled_hair,
+    "ShaderNodeBsdfPrincipled": h_principled,
+    "ShaderNodeBsdfSheen": h_sheen,
+    "ShaderNodeAmbientOcclusion": h_ambient_occlusion,
+    "ShaderNodeVolumeScatter": h_volume_phase,
+    "ShaderNodeVolumeCoefficients": h_volume_phase,
+    "ShaderNodeWireframe": h_wireframe,
+    "ShaderNodeVertexColor": h_vertex_color,
+    "ShaderNodeBump": h_bump,
+    "ShaderNodeTexImage": h_image,
+    "ShaderNodeTexEnvironment": h_environment,
+    "ShaderNodeTexGradient": h_gradient,
+    "ShaderNodeTexVoronoi": h_voronoi,
+    "ShaderNodeTexMagic": h_magic,
+    "ShaderNodeTexWave": h_wave,
+    "ShaderNodeTexChecker": h_checker,
+    "ShaderNodeTexBrick": h_brick,
+    "ShaderNodeTexNoise": h_noise,
+    "ShaderNodeTexGabor": h_gabor,
+    "ShaderNodeTexCoord": h_tex_coord,
+    "ShaderNodeTexSky": h_sky,
+    "ShaderNodeTexIES": h_ies,
+    "ShaderNodeTexWhiteNoise": h_white_noise,
+    "ShaderNodeNormalMap": h_normal_map,
+    "ShaderNodeRadialTiling": h_radial_tiling,
+    "ShaderNodeTangent": h_tangent,
+    "ShaderNodeUVMap": h_uvmap,
+    "ShaderNodeBevel": h_bevel,
+    "ShaderNodeDisplacement": h_displacement,
+    "ShaderNodeVectorDisplacement": h_vector_displacement,
+    "ShaderNodeOutputAOV": h_aov,
+    "ShaderNodeRaycast": h_raycast,
+}
+
+
+def mix_class(n):
+    if n.data_type == 'VECTOR':
+        return "MixVectorNode" if n.factor_mode == 'UNIFORM' else "MixVectorNonUniformNode"
+    if n.data_type == 'RGBA':
+        return "MixColorNode"
+    return "MixFloatNode"
+
+
+def map_range_class(n):
+    return "VectorMapRangeNode" if n.data_type == 'FLOAT_VECTOR' else "MapRangeNode"
+
+
+DYNAMIC_CLASS = {
+    "ShaderNodeMix": mix_class,
+    "ShaderNodeMapRange": map_range_class,
+}
+
+
+def add_node(writer, b_ntree, b_node, prefix):
+    """add_node() in shader.cpp, returns the XMLNode or None for unsupported nodes."""
+    idname = b_node.bl_idname
+
+    if idname in node_map.IGNORED_NODE_IDNAMES or idname in node_map.OUTPUT_NODE_IDNAMES:
+        return None
+
+    if idname == "ShaderNodeScript":
+        report(f'Script node "{b_node.name}" skipped, the CyclesPhi XML reader has no OSL support.')
+        return None
+
+    if idname in DYNAMIC_CLASS:
+        class_name = DYNAMIC_CLASS[idname](b_node)
+    else:
+        class_name = node_map.BLENDER_TO_CYCLES_CLASS.get(idname)
+
+    if class_name is None:
+        report(f'Node "{b_node.name}" ({idname}) is not supported by Cycles, skipped.')
+        return None
+
+    xml_type = node_map.class_to_xml_type(class_name)
+    if xml_type is None:
+        report(f'Node "{b_node.name}" ({idname}): {class_name} is not available in CyclesPhi, skipped.')
+        return None
+
+    xn = writer.add_node(xml_type, prefix + b_node.name)
+    if xn is None:
+        return None
+
+    handler = NODE_HANDLERS.get(idname)
+    if handler:
+        handler(b_ntree, b_node, xn)
+
+    if idname == "ShaderNodeRaycast" and len(b_node.outputs) > len(xn.type.outputs):
+        report(f'Raycast node "{b_node.name}": sampled attribute outputs are not supported in XML.')
+
+    return xn
 
 #########################################################################################
-def get_link_from_socket_identifier(link):
-  identifier = link.from_socket.identifier
+# Sockets
 
-  if link.from_node.type == 'ADD_SHADER':
-     if link.from_socket.identifier == 'Shader':
-        identifier = 'Closure'
 
-  elif link.from_node.type == 'MIX_SHADER':
-     if link.from_socket.identifier == 'Shader':
-        identifier = 'Closure'        
+def node_find_input_by_name(b_node, xn, b_socket):
+    """node_find_input_by_name() in shader.cpp"""
+    name = b_socket.identifier
+    node_type = xn.type
+    socket = node_type.input(name)
 
-  return identifier
+    if socket is None and node_type.class_name != "ConvertNode":
+        # Different internal name for shader.
+        if name.startswith("Shader"):
+            name = name.replace("Shader", "Closure")
 
-def get_link_to_socket_identifier(link):
-  identifier = link.to_socket.identifier
+        # Map mix node internal name for shader.
+        if b_node.bl_idname == "ShaderNodeMix":
+            for suffix, replacement in (("Factor_Float", "Factor"), ("Factor_Vector", "Factor"),
+                                        ("A_Float", "A"), ("B_Float", "B"),
+                                        ("A_Color", "A"), ("B_Color", "B"),
+                                        ("A_Vector", "A"), ("B_Vector", "B")):
+                if name.endswith(suffix):
+                    name = name.replace(suffix, replacement)
+                    break
 
-  if link.to_node.type == 'ADD_SHADER':
-     if link.to_socket.identifier == 'Shader':
-        identifier = 'Closure1'
-     elif link.to_socket.identifier == 'Shader_001':
-        identifier = 'Closure2'
+        socket = node_type.input(name)
 
-  elif link.to_node.type == 'MIX_SHADER':
-     if link.to_socket.identifier == 'Shader':
-        identifier = 'Closure1'
-     elif link.to_socket.identifier == 'Shader_001':
-        identifier = 'Closure2'
+        if socket is None:
+            # Different internal numbering of two sockets with same name.
+            if name.endswith("_001"):
+                name = name.replace("_001", "2")
+            elif name.endswith(".001"):
+                name = name.replace(".001", "2")
+            elif name.endswith("_002"):
+                name = name.replace("_002", "3")
+            elif name.endswith(".002"):
+                name = name.replace(".002", "3")
+            else:
+                name += "1"
+            socket = node_type.input(name)
 
-  elif link.to_node.type == 'MATH':
-     if link.to_socket.identifier == 'Value':
-        identifier = 'Value1'
-     elif link.to_socket.identifier == 'Value_001':
-        identifier = 'Value2'
-     elif link.to_socket.identifier == 'Value_002':
-        identifier = 'Value3'              
+    return socket
 
-  return identifier
+
+def node_find_output_by_name(b_node, xn, b_socket):
+    """node_find_output_by_name() in shader.cpp"""
+    name = b_socket.identifier
+    node_type = xn.type
+    socket = node_type.output(name)
+
+    if socket is None and node_type.class_name != "ConvertNode":
+        if name == "Shader":
+            name = "Closure"
+            socket = node_type.output(name)
+        if b_node.bl_idname == "ShaderNodeMix":
+            for suffix in ("Result_Float", "Result_Color", "Result_Vector"):
+                if name.endswith(suffix):
+                    name = name.replace(suffix, "Result")
+                    socket = node_type.output(name)
+                    break
+        elif b_node.bl_idname == "FunctionNodeInputVector":
+            # ColorNode has an output called "Color".
+            if name == "Vector":
+                name = "Color"
+                socket = node_type.output(name)
+
+    return socket
+
+
+def set_default_value(xn, socket, b_socket, b_ntree):
+    """set_default_value() in shader.cpp: copy values of the Blender socket to the Cycles input."""
+    if not hasattr(b_socket, "default_value"):
+        return
+    value = b_socket.default_value
+
+    if socket.type == "float":
+        xn.set_socket(socket, float(value if is_scalar(value) else value[0]))
+    elif socket.type == "int":
+        xn.set_socket(socket, int(value if is_scalar(value) else value[0]))
+    elif socket.type in ("color", "vector", "point", "normal"):
+        xn.set_socket(socket, value)
+    elif socket.type == "string":
+        xn.set_socket(socket, blender_absolute_path(b_ntree, value))
+
+
+def map_node_sockets(writer, b_ntree, b_node, xn, input_map, output_map):
+    """Map the Blender sockets of a node to its Cycles sockets and copy the default values."""
+    for b_input in b_node.inputs:
+        if not socket_is_available(b_input):
+            continue
+        socket = node_find_input_by_name(b_node, xn, b_input)
+        if socket is None:
+            if b_input.is_linked:
+                report(f'Input "{b_input.identifier}" of node "{b_node.name}" has no Cycles socket, '
+                       f'link skipped.')
+            continue
+        if input_map is not None:
+            input_map[b_input.as_pointer()].append((xn, socket))
+        set_default_value(xn, socket, b_input, b_ntree)
+
+    for b_output in b_node.outputs:
+        if not socket_is_available(b_output):
+            continue
+        socket = node_find_output_by_name(b_node, xn, b_output)
+        if socket is None:
+            if b_output.is_linked:
+                report(f'Output "{b_output.identifier}" of node "{b_node.name}" has no Cycles socket, '
+                       f'link skipped.')
+            continue
+        if output_map is not None:
+            output_map[b_output.as_pointer()] = (xn, socket)
+
 #########################################################################################
+# Graph, add_nodes() in shader.cpp
 
-# Write a node and its attributes to XML
-def xml_write_node(writer_base: XMLWriter, node, xml_root: ET.Element):   
-    xml_node = create_xml_node(writer_base, xml_root, node)
 
-    # Types: ('CUSTOM', 'VALUE', 'INT', 'BOOLEAN', 'VECTOR', 'ROTATION', 'MATRIX', 
-    # 'STRING', 'RGBA', 'SHADER', 'OBJECT', 'IMAGE', 'GEOMETRY', 'COLLECTION', 
-    # 'TEXTURE', 'MATERIAL', 'MENU')
-    for socket in node.inputs:
-        xml_write_socket(writer_base, xml_node, node, socket)
+def find_output_node(b_ntree):
+    """ntreeShaderOutputNode(ntree, SHD_OUTPUT_CYCLES)"""
+    output_node = None
+    for node in b_ntree.nodes:
+        if node.bl_idname not in node_map.OUTPUT_NODE_IDNAMES:
+            continue
+        target = getattr(node, "target", 'ALL')
+        current_target = getattr(output_node, "target", 'ALL')
+        if target == 'ALL':
+            if output_node is None:
+                output_node = node
+            elif current_target == 'ALL':
+                if node.is_active_output and not output_node.is_active_output:
+                    output_node = node
+        elif target == 'CYCLES':
+            if output_node is None or current_target == 'ALL':
+                output_node = node
+            elif node.is_active_output and not output_node.is_active_output:
+                output_node = node
+    return output_node
 
-    # for socket in node.outputs:
-    #     xml_write_socket(writer_base, xml_node, node, socket)       
 
-    return xml_node
+def internal_links(b_node):
+    links = [(link.from_socket, link.to_socket) for link in b_node.internal_links]
+    if not links and b_node.bl_idname == "NodeReroute" and b_node.inputs and b_node.outputs:
+        links = [(b_node.inputs[0], b_node.outputs[0])]
+    return links
 
-def export_shader(shader, node_tree):
-    # Create the root element
-    shader_xml = ET.Element("shader")
-    shader_xml.set("name", shader.name)
 
-    writer_base = XMLWriter()
-    writer_base.base = ""
+def add_nodes(writer, b_ntree, prefix="", proxy_input_map=None, proxy_output_map=None):
+    """Add the nodes of a tree to the graph. Node groups are inlined recursively, connected
+    through proxy nodes (ConvertNode with equal input and output type) like in shader.cpp."""
+    proxy_input_map = proxy_input_map or {}
+    proxy_output_map = proxy_output_map or {}
+    is_top_level = not prefix
 
-    for node in node_tree.nodes:
-        if node.type == "OUTPUT_MATERIAL":
+    input_map = defaultdict(list)  # Blender input socket -> [(XMLNode, CyclesSocket)]
+    output_map = {}                # Blender output socket -> (XMLNode, CyclesSocket)
+
+    # Only the output node of the top level tree is used.
+    output_node = find_output_node(b_ntree) if is_top_level else None
+
+    for b_node in b_ntree.nodes:
+        idname = b_node.bl_idname
+
+        if b_node.mute or idname == "NodeReroute":
+            # Replace muted node with internal links.
+            for b_from, b_to in internal_links(b_node):
+                socket_type = convert_socket_type(b_to)
+                if socket_type is None:
+                    continue
+                proxy = writer.add_proxy(socket_type, f"{prefix}{b_node.name}:{b_to.identifier}")
+                input_map[b_from.as_pointer()].append((proxy, proxy.type.inputs[0]))
+                output_map[b_to.as_pointer()] = (proxy, proxy.type.outputs[0])
+
+        elif idname in ("ShaderNodeGroup", "NodeCustomGroup"):
+            b_group_ntree = b_node.node_tree
+            group_proxy_input_map = {}
+            group_proxy_output_map = {}
+
+            # Add a proxy node for each socket, even if the node group has no internal tree,
+            # so that links have something to connect to.
+            for b_input in b_node.inputs:
+                socket_type = convert_socket_type(b_input)
+                if socket_type is None:
+                    continue
+                proxy = writer.add_proxy(socket_type, f"{prefix}{b_node.name}:in:{b_input.identifier}")
+                group_proxy_input_map[b_input.identifier] = proxy
+                input_map[b_input.as_pointer()].append((proxy, proxy.type.inputs[0]))
+                set_default_value(proxy, proxy.type.inputs[0], b_input, b_ntree)
+
+            for b_output in b_node.outputs:
+                socket_type = convert_socket_type(b_output)
+                if socket_type is None:
+                    continue
+                proxy = writer.add_proxy(socket_type, f"{prefix}{b_node.name}:out:{b_output.identifier}")
+                group_proxy_output_map[b_output.identifier] = proxy
+                output_map[b_output.as_pointer()] = (proxy, proxy.type.outputs[0])
+
+            if b_group_ntree:
+                add_nodes(writer, b_group_ntree, f"{prefix}{b_node.name}/",
+                          group_proxy_input_map, group_proxy_output_map)
+
+        elif idname == "NodeGroupInput":
+            for b_output in b_node.outputs:
+                proxy = proxy_input_map.get(b_output.identifier)
+                if proxy:
+                    output_map[b_output.as_pointer()] = (proxy, proxy.type.outputs[0])
+
+        elif idname == "NodeGroupOutput":
+            # Only the active group output is used.
+            if b_node.is_active_output:
+                for b_input in b_node.inputs:
+                    proxy = proxy_output_map.get(b_input.identifier)
+                    if proxy:
+                        input_map[b_input.as_pointer()].append((proxy, proxy.type.inputs[0]))
+                        set_default_value(proxy, proxy.type.inputs[0], b_input, b_ntree)
+
+        else:
+            if output_node is not None and b_node == output_node:
+                xn = writer.output_node()
+            else:
+                xn = add_node(writer, b_ntree, b_node, prefix)
+
+            if xn is not None:
+                map_node_sockets(writer, b_ntree, b_node, xn, input_map, output_map)
+
+    # Connect nodes.
+    for b_link in b_ntree.links:
+        # Ignore invalid links to avoid unwanted cycles created in graph.
+        # Also ignore links with unavailable sockets.
+        if (not b_link.is_valid or b_link.is_muted or
+                not socket_is_available(b_link.from_socket) or
+                not socket_is_available(b_link.to_socket)):
             continue
 
-        xml_write_node(writer_base, node, shader_xml)
-        # Create a child element for principled_volume
-        #node_xml = ET.SubElement(shader_xml, braas_hpc_xmlmaterial_map.enum_to_xml_type(node.type))
-        #node_xml.set("name", node.name)
+        # Either socket may be missing when the node was not exported, typically
+        # because the node type is not supported.
+        output = output_map.get(b_link.from_socket.as_pointer())
+        if output is None:
+            continue
+        for to_input in input_map.get(b_link.to_socket.as_pointer(), ()):
+            writer.connect(output, to_input)
 
-        #for input in node.inputs:
-        #    node_xml.set(input.identifier, "")
-        # principled_volume.set("temperature_attribute", "temperature")
-
-    for node in node_tree.nodes:
-        for output in node.outputs:
-            for link in output.links:
-                # xml_node connect_node = xml_root.append_child("connect");
-                connect_node = ET.SubElement(shader_xml, "connect")
-
-                # xml_attribute attr_from_node = connect_node.append_attribute("from_node");
-                # attr_from_node = xml_pointer_to_name(output->parent).c_str();
-                connect_node.set("from_node", link.from_node.name)
-
-                # xml_attribute attr_from_socket = connect_node.append_attribute("from_socket");
-                # attr_from_socket = output->socket_type.name.c_str();                
-
-                # xml_attribute attr_from_socket_ui = connect_node.append_attribute("from_socket_ui");
-                # attr_from_socket_ui = output->socket_type.ui_name.c_str();
-                connect_node.set("from_socket_ui", get_link_from_socket_identifier(link))
-
-                # xml_attribute attr_to_node = connect_node.append_attribute("to_node");
-                # string to_name = xml_pointer_to_name(input->parent);
-                # if (OutputNode* output_node = dynamic_cast<OutputNode*>(input->parent))
-                # 	to_name = input->parent->name.string(); // output
-                # attr_to_node = to_name.c_str();
-                connect_node.set("to_node", link.to_node.name)
-                	
-                # xml_attribute attr_to_socket = connect_node.append_attribute("to_socket");
-                # attr_to_socket = input->socket_type.name.c_str();
-
-                # xml_attribute attr_to_socket_ui = connect_node.append_attribute("to_socket_ui");
-                # attr_to_socket_ui = input->socket_type.ui_name.c_str();
-                connect_node.set("to_socket_ui", get_link_to_socket_identifier(link))
-
-    # # Create a child element for connect
-    # connect = ET.SubElement(shader, "connect")
-    # connect.set("from", "2257750539968 volume")
-    # connect.set("to", "output volume")
-
-    # Convert the ElementTree to a string
-    #xml_string = ET.tostring(shader_xml, encoding="unicode")
-    # Pretty print the XML
-    xml_string = ET.tostring(shader_xml, encoding="unicode")
-    parsed_xml = minidom.parseString(xml_string)
-    pretty_xml = parsed_xml.toprettyxml()
-
-    # shader_xml_path = "e:\\tmp\\braas_hpc_xmlmaterial\\shader.xml"
-    # # Write the XML string to a file
-    # with open(shader_xml_path, "w", encoding="utf-8") as xml_file:
-    #     xml_file.write(pretty_xml)
-
-    # print("XML file created successfully: ", shader_xml_path)
-
-    return pretty_xml
+#########################################################################################
+# Shader settings, sync_materials() / sync_world() / sync_lights() in shader.cpp
 
 
-def export_node(shader, node):
-    # Create the root element
-    shader_xml = ET.Element("shader")
-    shader_xml.set("name", shader.name)
+def add_default_graph(writer, shader):
+    """Graph used by Cycles for data-blocks without a node tree."""
+    output = writer.output_node()
+    if isinstance(shader, bpy.types.World):
+        node = writer.add_node("background_shader", "background")
+        node.set("color", shader.color)
+        writer.connect((node, node.type.output("Background")), (output, output.type.input("Surface")))
+    elif isinstance(shader, bpy.types.Light):
+        node = writer.add_node("emission", "emission")
+        node.set("color", (1.0, 1.0, 1.0))
+        node.set("strength", 1.0)
+        writer.connect((node, node.type.output("Emission")), (output, output.type.input("Surface")))
+    else:
+        node = writer.add_node("diffuse_bsdf", "diffuse")
+        if shader is not None and hasattr(shader, "diffuse_color"):
+            node.set("color", shader.diffuse_color)
+        writer.connect((node, node.type.output("BSDF")), (output, output.type.input("Surface")))
 
-    writer_base = XMLWriter()
-    writer_base.base = ""
-    xml_write_node(writer_base, node, shader_xml)
 
-    # Pretty print the XML
-    xml_string = ET.tostring(shader_xml, encoding="unicode")
-    parsed_xml = minidom.parseString(xml_string)
-    pretty_xml = parsed_xml.toprettyxml()
+def shader_settings(writer, shader):
+    """Settings of the Cycles Shader, written as <socket> children of <shader>."""
+    settings = XMLNode(writer, cycles_node_type("shader"), "shader")
 
-    return pretty_xml
+    if isinstance(shader, bpy.types.Material):
+        settings.set("pass_id", shader.pass_index)
+        settings.set("use_transparent_shadow", shader.use_transparent_shadow)
+        # DISPLACE_NUM_METHODS = 3, DISPLACE_BUMP = 0
+        settings.set("displacement_method",
+                     validate_enum_value(enum_value(shader, "displacement_method"), 3, 0))
+
+        # Settings of the Cycles add-on, missing when the add-on is disabled.
+        cmat = getattr(shader, "cycles", None)
+        if cmat is None:
+            report(f'Cycles settings of material "{shader.name}" are not available, using defaults.')
+            return settings
+        # EMISSION_SAMPLING_NUM = 5, EMISSION_SAMPLING_AUTO = 1
+        settings.set("emission_sampling_method",
+                     validate_enum_value(enum_value(cmat, "emission_sampling"), 5, 1))
+        if hasattr(cmat, "use_bump_map_correction"):
+            settings.set("use_bump_map_correction", cmat.use_bump_map_correction)
+        # VOLUME_NUM_SAMPLING = 3, VOLUME_SAMPLING_DISTANCE = 0
+        settings.set("volume_sampling_method",
+                     validate_enum_value(enum_value(cmat, "volume_sampling"), 3, 0))
+        # VOLUME_NUM_INTERPOLATION = 2, VOLUME_INTERPOLATION_LINEAR = 0
+        settings.set("volume_interpolation_method",
+                     validate_enum_value(enum_value(cmat, "volume_interpolation"), 2, 0))
+        settings.set("volume_step_rate", cmat.volume_step_rate)
+
+    elif isinstance(shader, bpy.types.World) and shader.node_tree:
+        cworld = getattr(shader, "cycles", None)
+        if cworld is None:
+            return settings
+        settings.set("volume_sampling_method",
+                     validate_enum_value(enum_value(cworld, "volume_sampling"), 3, 0))
+        settings.set("volume_interpolation_method",
+                     validate_enum_value(enum_value(cworld, "volume_interpolation"), 2, 0))
+        settings.set("volume_step_rate", cworld.volume_step_size)
+
+    return settings
+
+
+def shader_name(shader):
+    if isinstance(shader, bpy.types.World):
+        # sync_world() fills Scene::default_background.
+        return WORLD_SHADER_NAME
+    return shader.name if shader is not None else "shader"
+
+#########################################################################################
+# XML output
+
+
+def xml_to_string(xml_root):
+    ET.indent(xml_root, space="  ")
+    text = ET.tostring(xml_root, encoding="unicode")
+    # Control characters (attribute name prefixes) are not allowed raw in XML.
+    for c in range(0x20):
+        if chr(c) in text and c not in (0x09, 0x0A, 0x0D):
+            text = text.replace(chr(c), f"&#x{c:X};")
+    return '<?xml version="1.0" ?>\n' + text + "\n"
+
+
+def write_xml(writer, name, settings=None):
+    xml_root = ET.Element("shader", name=name)
+
+    if settings is not None:
+        settings.write_sockets(xml_root)
+
+    for node in writer.nodes:
+        node.to_xml(xml_root)
+
+    for (from_node, from_socket), (to_node, to_socket) in writer.connections:
+        ET.SubElement(xml_root, "connect",
+                      from_node=from_node.name,
+                      from_socket=from_socket.name,
+                      from_socket_ui=from_socket.ui_name,
+                      to_node=to_node.name,
+                      to_socket=to_socket.name,
+                      to_socket_ui=to_socket.ui_name)
+
+    return xml_to_string(xml_root)
+
+
+def export_shader(shader, node_tree, binary=None):
+    """Export the shader graph of a material, world or light.
+
+    shader: the Material / World / Light (space_data.id of the shader editor).
+    node_tree: tree used when the data-block has no node tree of its own.
+    binary: optional bytearray receiving the array data, see XMLWriter.
+    """
+    writer = XMLWriter(binary)
+
+    # Export the whole shader even when the editor shows the inside of a node group.
+    tree = getattr(shader, "node_tree", None) or node_tree
+
+    settings = shader_settings(writer, shader)
+
+    if tree is not None:
+        add_nodes(writer, tree)
+    else:
+        add_default_graph(writer, shader)
+
+    return write_xml(writer, shader_name(shader), settings)
+
+
+def export_node(shader, node, binary=None):
+    """Export a single node with its parameters and input values, without connections."""
+    writer = XMLWriter(binary)
+    tree = node.id_data
+
+    if node.bl_idname in node_map.OUTPUT_NODE_IDNAMES:
+        report(f'Output node "{node.name}" has no parameters, it maps to the graph output "output".')
+        xn = None
+    elif node.bl_idname in ("ShaderNodeGroup", "NodeCustomGroup", "NodeReroute",
+                            "NodeGroupInput", "NodeGroupOutput"):
+        report(f'Node "{node.name}" is resolved only when exporting the whole shader.')
+        xn = None
+    else:
+        xn = add_node(writer, tree, node, "")
+
+    if xn is not None:
+        map_node_sockets(writer, tree, node, xn, None, None)
+
+    return write_xml(writer, shader_name(shader))
